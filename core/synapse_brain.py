@@ -27,7 +27,7 @@ import os
 import sqlite3
 import tempfile
 import numpy as np
-from typing import Dict, List, Any, Optional, Tuple, Set, Callable
+from typing import Dict, List, Any, Optional, Tuple, Set, Callable, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -43,9 +43,11 @@ except ImportError:
 
 # Gemini API
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:
     genai = None
+    genai_types = None
 
 
 def _load_env_file(env_path: Path) -> None:
@@ -73,12 +75,7 @@ GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.95"))
 GEMINI_TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
-EMBEDDING_MODELS = [
-    m.strip() for m in os.getenv(
-        "GEMINI_EMBEDDING_MODELS",
-        "models/text-embedding-004,models/embedding-001"
-    ).split(",") if m.strip()
-]
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
 SYNAPSE_AUTO_BACKFILL_EMBEDDINGS = os.getenv(
     "SYNAPSE_AUTO_BACKFILL_EMBEDDINGS", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -86,6 +83,43 @@ LLM_REQUIRED_ERROR = (
     "LLM is required but unavailable. Please install dependencies and set "
     "GEMINI_API_KEY in .env."
 )
+EMBEDDINGS_REQUIRED_ERROR = (
+    "Embedding service is required but unavailable. "
+    "Check GEMINI_EMBEDDING_MODEL and API permissions."
+)
+
+
+def _extract_first_json(
+    text: str,
+    expected: Optional[Union[type, Tuple[type, ...]]] = None
+) -> Optional[Any]:
+    """Extract the first valid JSON object/array from arbitrary model text."""
+    if not text:
+        return None
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+
+    try:
+        obj = json.loads(cleaned)
+        if expected is None or isinstance(obj, expected):
+            return obj
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(cleaned):
+        if ch not in "[{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(cleaned[idx:])
+            if expected is None or isinstance(obj, expected):
+                return obj
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+    return None
 
 
 # ======================== Data Structures ========================
@@ -204,58 +238,71 @@ class BM25:
 # ======================== Embedding Provider ========================
 
 class EmbeddingProvider:
-    """Gemini text-embedding-004: 768D embeddings for semantic retrieval."""
+    """Single-model embedding provider with strict availability checks."""
     def __init__(self, api_key: str = None):
         self.available = False
+        self.client = None
         self.model_name: Optional[str] = None
-        if api_key and genai:
+        self.error_message: Optional[str] = None
+        if api_key and genai and genai_types:
             try:
-                genai.configure(api_key=api_key)
-                for model_name in EMBEDDING_MODELS:
-                    try:
-                        result = genai.embed_content(
-                            model=model_name,
-                            content='test',
-                            task_type='RETRIEVAL_DOCUMENT'
-                        )
-                        self.dim = len(result['embedding'])
-                        self.model_name = model_name
-                        self.available = True
-                        print(f"  Embeddings: Gemini {self.dim}D connected ({model_name})")
-                        break
-                    except Exception:
-                        continue
-                if not self.available:
-                    print("  Embeddings: Failed (no configured embedding model available)")
+                self.client = genai.Client(api_key=api_key)
+                self.model_name = GEMINI_EMBEDDING_MODEL
+                probe = self.client.models.embed_content(
+                    model=self.model_name,
+                    contents="test"
+                )
+                values = self._extract_embedding_values(probe)
+                if not values:
+                    raise ValueError("Embedding probe returned empty vector.")
+                self.dim = len(values)
+                self.available = True
+                print(f"  Embeddings: Gemini {self.dim}D connected ({self.model_name})")
             except Exception as e:
-                print(f"  Embeddings: Failed ({e})")
+                self.error_message = str(e)
+                print(f"  Embeddings: Failed ({self.error_message})")
         else:
             print("  Embeddings: Offline")
 
+    def _extract_embedding_values(self, response: Any) -> Optional[List[float]]:
+        if response is None:
+            return None
+        embeddings = getattr(response, "embeddings", None)
+        if embeddings and len(embeddings) > 0:
+            first = embeddings[0]
+            vals = getattr(first, "values", None)
+            if vals:
+                return list(vals)
+        if isinstance(response, dict):
+            maybe_embeddings = response.get("embeddings")
+            if isinstance(maybe_embeddings, list) and maybe_embeddings:
+                first = maybe_embeddings[0]
+                if isinstance(first, dict) and isinstance(first.get("values"), list):
+                    return first["values"]
+        return None
+
     def embed_document(self, text: str) -> Optional[List[float]]:
-        if not self.available:
+        if not self.available or not self.client or not self.model_name:
             return None
         try:
-            result = genai.embed_content(
+            result = self.client.models.embed_content(
                 model=self.model_name,
-                content=text[:2000],
-                task_type='RETRIEVAL_DOCUMENT'
+                contents=text[:2000]
             )
-            return result['embedding']
-        except:
+            return self._extract_embedding_values(result)
+        except Exception:
             return None
 
     def embed_query(self, text: str) -> Optional[List[float]]:
-        if not self.available:
+        if not self.available or not self.client or not self.model_name:
             return None
         try:
-            result = genai.embed_content(
+            result = self.client.models.embed_content(
                 model=self.model_name,
-                content=text[:2000],
-                task_type='RETRIEVAL_QUERY'
+                contents=text[:2000]
             )
-            return result['embedding']
-        except:
+            return self._extract_embedding_values(result)
+        except Exception:
             return None
 
 
@@ -697,20 +744,20 @@ class VectorStore:
 
 class LLMProvider:
     def __init__(self, api_key: str = None):
-        self.model = None
+        self.client = None
         self.call_count = 0
         self.model_name = GEMINI_MODEL
-        self.generation_config = {
-            "temperature": GEMINI_TEMPERATURE,
-            "top_p": GEMINI_TOP_P,
-            "top_k": GEMINI_TOP_K,
-            "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
-            "candidate_count": 1,
-        }
-        if api_key and genai:
+        self.generation_config = None
+        if api_key and genai and genai_types:
             try:
-                genai.configure(api_key=api_key)
-                self.model = genai.GenerativeModel(self.model_name)
+                self.client = genai.Client(api_key=api_key)
+                self.generation_config = genai_types.GenerateContentConfig(
+                    temperature=GEMINI_TEMPERATURE,
+                    top_p=GEMINI_TOP_P,
+                    top_k=GEMINI_TOP_K,
+                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                    candidate_count=1,
+                )
                 print(f"  LLM: Gemini connected ({self.model_name}, temp={GEMINI_TEMPERATURE})")
             except Exception as e:
                 print(f"  LLM: Failed ({e})")
@@ -718,17 +765,19 @@ class LLMProvider:
             print("  LLM: Offline")
 
     def generate(self, prompt: str, max_retries: int = 3) -> Optional[str]:
-        if not self.model:
+        if not self.client:
             return None
         for attempt in range(max_retries):
             try:
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config=self.generation_config
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=self.generation_config,
                 )
                 self.call_count += 1
-                if response and response.text:
-                    return response.text.strip()
+                text = getattr(response, "text", None)
+                if text:
+                    return text.strip()
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
@@ -738,7 +787,7 @@ class LLMProvider:
 
     @property
     def is_available(self) -> bool:
-        return self.model is not None
+        return self.client is not None
 
 
 # ======================== Memory System ========================
@@ -923,22 +972,18 @@ Chunk:
             self._incr_stat('llm_calls_for_memory')
             if not response:
                 continue
-            try:
-                match = re.search(r'\{.*\}', response, re.DOTALL)
-                if not match:
-                    continue
-                data = json.loads(match.group())
-                points = data.get('key_points', [])
-                entities = data.get('entities', [])
-                point_text = " | ".join([p for p in points if isinstance(p, str)][:4])
-                entity_text = ", ".join([e for e in entities if isinstance(e, str)][:6])
-                if point_text or entity_text:
-                    chunk_notes.append(
-                        f"Chunk {idx+1}: {point_text}"
-                        + (f" [Entities: {entity_text}]" if entity_text else "")
-                    )
-            except (json.JSONDecodeError, KeyError):
+            data = _extract_first_json(response, dict)
+            if not isinstance(data, dict):
                 continue
+            points = data.get('key_points', [])
+            entities = data.get('entities', [])
+            point_text = " | ".join([p for p in points if isinstance(p, str)][:4])
+            entity_text = ", ".join([e for e in entities if isinstance(e, str)][:6])
+            if point_text or entity_text:
+                chunk_notes.append(
+                    f"Chunk {idx+1}: {point_text}"
+                    + (f" [Entities: {entity_text}]" if entity_text else "")
+                )
 
         if not chunk_notes:
             return coverage_excerpt
@@ -1080,16 +1125,12 @@ Return ONLY the JSON array."""
             self._incr_stat('llm_calls_for_memory')
             if not response:
                 continue
-            try:
-                json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                if not json_match:
-                    continue
-                facts_data = json.loads(json_match.group())
-                for item in facts_data:
-                    if isinstance(item, dict) and 'fact' in item:
-                        all_facts.append((item['fact'], item.get('evidence', '')))
-            except (json.JSONDecodeError, KeyError):
+            facts_data = _extract_first_json(response, list)
+            if not isinstance(facts_data, list):
                 continue
+            for item in facts_data:
+                if isinstance(item, dict) and 'fact' in item:
+                    all_facts.append((item['fact'], item.get('evidence', '')))
         return self._dedupe_fact_pairs(all_facts, max_items=24)
 
     def _auto_connect(self, memcell_ids: List[str]):
@@ -1140,29 +1181,25 @@ Return ONLY JSON."""
         self._incr_stat('llm_calls_for_memory')
         if not response:
             return None
-        try:
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not json_match:
-                return None
-            data = json.loads(json_match.group())
-            episode = Episode(
-                id=episode_id,
-                subject=data.get('subject', 'Research Document'),
-                summary=data.get('summary', ''),
-                narrative=data.get('narrative', ''),
-                memcell_ids=memcell_ids,
-                timestamp=datetime.now(),
-                keywords=self._tokenize(
-                    data.get('subject', '') + ' ' + data.get('summary', ''))
-            )
-            self.episodes[episode_id] = episode
-            self._incr_stat('total_episodes')
-            self.bm25.add_document(f"ep_{episode_id}", episode.keywords)
-            if self.db:
-                self.db.insert_episode(episode)
-            return episode
-        except (json.JSONDecodeError, KeyError):
+        data = _extract_first_json(response, dict)
+        if not isinstance(data, dict):
             return None
+        episode = Episode(
+            id=episode_id,
+            subject=data.get('subject', 'Research Document'),
+            summary=data.get('summary', ''),
+            narrative=data.get('narrative', ''),
+            memcell_ids=memcell_ids,
+            timestamp=datetime.now(),
+            keywords=self._tokenize(
+                data.get('subject', '') + ' ' + data.get('summary', ''))
+        )
+        self.episodes[episode_id] = episode
+        self._incr_stat('total_episodes')
+        self.bm25.add_document(f"ep_{episode_id}", episode.keywords)
+        if self.db:
+            self.db.insert_episode(episode)
+        return episode
 
     def _extract_foresight(self, content: str, source: str, memcell_ids: List[str],
                            chunks: Optional[List[str]] = None,
@@ -1185,22 +1222,19 @@ Return ONLY JSON array."""
         response = self.llm.generate(prompt)
         self._incr_stat('llm_calls_for_memory')
         if response:
-            try:
-                json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                if json_match:
-                    for pred in json.loads(json_match.group())[:3]:
-                        if 'prediction' in pred:
-                            mem = self._store_memcell(
-                                content=f"[Foresight] {pred['prediction']} (Timeline: {pred.get('timeline', 'unknown')})",
-                                memory_type=MemoryType.FORESIGHT,
-                                evidence=[Evidence(content=pred.get('evidence', ''),
-                                                   source=source, type="inferred", confidence=0.5)],
-                                source_doc=source, importance=0.6
-                            )
-                            for mid in memcell_ids[:3]:
-                                self._connect(mem.id, mid)
-            except (json.JSONDecodeError, KeyError):
-                pass
+            predictions = _extract_first_json(response, list)
+            if isinstance(predictions, list):
+                for pred in predictions[:3]:
+                    if isinstance(pred, dict) and 'prediction' in pred:
+                        mem = self._store_memcell(
+                            content=f"[Foresight] {pred['prediction']} (Timeline: {pred.get('timeline', 'unknown')})",
+                            memory_type=MemoryType.FORESIGHT,
+                            evidence=[Evidence(content=pred.get('evidence', ''),
+                                               source=source, type="inferred", confidence=0.5)],
+                            source_doc=source, importance=0.6
+                        )
+                        for mid in memcell_ids[:3]:
+                            self._connect(mem.id, mid)
 
     def _extract_topics(self, content: str, chunks: Optional[List[str]] = None,
                         doc_summary: Optional[str] = None) -> List[str]:
@@ -1214,12 +1248,9 @@ Coverage excerpt:
         response = self.llm.generate(prompt)
         self._incr_stat('llm_calls_for_memory')
         if response:
-            try:
-                json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                if json_match:
-                    return json.loads(json_match.group())
-            except:
-                pass
+            parsed_topics = _extract_first_json(response, list)
+            if isinstance(parsed_topics, list):
+                return [t for t in parsed_topics if isinstance(t, str)]
         return []
 
     def _update_profile(self, topic: str, memcell_ids: List[str]):
@@ -1309,35 +1340,33 @@ Return ONLY JSON."""
                 response = self.llm.generate(prompt)
                 self._incr_stat('llm_calls_for_memory')
                 if response:
-                    try:
-                        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                        if json_match:
-                            data = json.loads(json_match.group())
-                            relation = data.get('relation', 'same')
-                            if relation == 'contradictory':
-                                self._store_memcell(
-                                    content=f"[Contradiction] {data.get('explanation', 'Conflicting claims detected')}\nClaim A: {old_content}\nClaim B: {new_content}",
-                                    memory_type=MemoryType.CONTRADICTION,
-                                    evidence=[
-                                        Evidence(content=old_content, source=old_source,
-                                                 type="direct", confidence=0.9),
-                                        Evidence(content=new_content, source=new_source,
-                                                 type="direct", confidence=0.9)
-                                    ],
-                                    importance=0.8
-                                )
-                                self._incr_stat('total_contradictions')
-                            elif relation == 'same':
-                                # Strengthen connection, boost importance
-                                self._connect(new_id, old_id)
-                                self.memcells[old_id].importance = min(1.0,
-                                    self.memcells[old_id].importance + 0.1)
-                                if self.db:
-                                    self.db.update_memcell_importance(
-                                        old_id, self.memcells[old_id].importance)
-                            else:
-                                self._connect(new_id, old_id)
-                    except (json.JSONDecodeError, KeyError):
+                    data = _extract_first_json(response, dict)
+                    if isinstance(data, dict):
+                        relation = data.get('relation', 'same')
+                        if relation == 'contradictory':
+                            self._store_memcell(
+                                content=f"[Contradiction] {data.get('explanation', 'Conflicting claims detected')}\nClaim A: {old_content}\nClaim B: {new_content}",
+                                memory_type=MemoryType.CONTRADICTION,
+                                evidence=[
+                                    Evidence(content=old_content, source=old_source,
+                                             type="direct", confidence=0.9),
+                                    Evidence(content=new_content, source=new_source,
+                                             type="direct", confidence=0.9)
+                                ],
+                                importance=0.8
+                            )
+                            self._incr_stat('total_contradictions')
+                        elif relation == 'same':
+                            # Strengthen connection, boost importance
+                            self._connect(new_id, old_id)
+                            self.memcells[old_id].importance = min(1.0,
+                                self.memcells[old_id].importance + 0.1)
+                            if self.db:
+                                self.db.update_memcell_importance(
+                                    old_id, self.memcells[old_id].importance)
+                        else:
+                            self._connect(new_id, old_id)
+                    else:
                         self._connect(new_id, old_id)
 
     # ---- Storage ----
@@ -1576,34 +1605,29 @@ Return ONLY JSON."""
         self._incr_stat('llm_calls_for_memory')
 
         if response:
-            try:
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group())
-                    if not data.get('sufficient', True):
-                        additional: Dict[str, float] = {}
-                        for rq in data.get('refined_queries', [])[:3]:
-                            rq_results = self._hybrid_retrieval(
-                                rq, self._tokenize(rq), top_k, allowed_types
-                            )
-                            for mem, score in rq_results:
-                                if mem.id not in additional or score > additional[mem.id]:
-                                    additional[mem.id] = score
+            data = _extract_first_json(response, dict)
+            if isinstance(data, dict) and not data.get('sufficient', True):
+                additional: Dict[str, float] = {}
+                for rq in data.get('refined_queries', [])[:3]:
+                    rq_results = self._hybrid_retrieval(
+                        rq, self._tokenize(rq), top_k, allowed_types
+                    )
+                    for mem, score in rq_results:
+                        if mem.id not in additional or score > additional[mem.id]:
+                            additional[mem.id] = score
 
-                        merged: Dict[str, float] = {}
-                        for mem, score in initial_results:
-                            merged[mem.id] = score
-                        for mem_id, score in additional.items():
-                            if mem_id in merged:
-                                merged[mem_id] += score * 0.5
-                            else:
-                                merged[mem_id] = score * 0.5
+                merged: Dict[str, float] = {}
+                for mem, score in initial_results:
+                    merged[mem.id] = score
+                for mem_id, score in additional.items():
+                    if mem_id in merged:
+                        merged[mem_id] += score * 0.5
+                    else:
+                        merged[mem_id] = score * 0.5
 
-                        sorted_merged = sorted(merged.items(), key=lambda x: x[1], reverse=True)
-                        return [(self.memcells[mid], s) for mid, s in sorted_merged[:top_k]
-                                if self._is_allowed_memcell(mid, allowed_types)]
-            except (json.JSONDecodeError, KeyError):
-                pass
+                sorted_merged = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+                return [(self.memcells[mid], s) for mid, s in sorted_merged[:top_k]
+                        if self._is_allowed_memcell(mid, allowed_types)]
 
         return initial_results
 
@@ -1980,12 +2004,9 @@ Return ONLY JSON."""
 
         response = self.llm.generate(prompt)
         if response:
-            try:
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    return json.loads(json_match.group())
-            except:
-                pass
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                return parsed
         return None
 
     def _retrieve_for_feedback(self, feedback: Dict) -> Optional[str]:
@@ -2166,13 +2187,10 @@ Return JSON only:
         response = self.llm.generate(prompt)
         if not response:
             return None
-        try:
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            if not match:
-                return None
-            return json.loads(match.group())
-        except (json.JSONDecodeError, KeyError):
-            return None
+        parsed = _extract_first_json(response, dict)
+        if isinstance(parsed, dict):
+            return parsed
+        return None
 
     def _store_qa(self, question: str, answer: str, retrieved: List,
                   evidence_contract: Optional[Dict[str, Any]] = None):
@@ -2326,11 +2344,10 @@ What are the 2-3 most critical unanswered questions?
 Return as JSON array of strings. Return ONLY JSON array.""")
 
         if gaps_response:
-            try:
-                m = re.search(r'\[.*\]', gaps_response, re.DOTALL)
-                if m:
-                    ir['gaps'] = json.loads(m.group())
-            except:
+            parsed_gaps = _extract_first_json(gaps_response, list)
+            if isinstance(parsed_gaps, list):
+                ir['gaps'] = [g for g in parsed_gaps if isinstance(g, str)]
+            else:
                 ir['gaps'] = [gaps_response[:200]]
 
         # Phase 3: Evidence-chain hypotheses
@@ -2349,12 +2366,9 @@ Return JSON array: [{{"hypothesis": "...", "evidence_chain": "Based on [N]... an
 Return ONLY JSON.""")
 
         if hyp_response:
-            try:
-                m = re.search(r'\[.*\]', hyp_response, re.DOTALL)
-                if m:
-                    ir['hypotheses'] = json.loads(m.group())
-            except:
-                pass
+            parsed_hyp = _extract_first_json(hyp_response, list)
+            if isinstance(parsed_hyp, list):
+                ir['hypotheses'] = [h for h in parsed_hyp if isinstance(h, dict)]
 
         # Phase 4: Critical evaluation
         if ir['hypotheses']:
@@ -2371,12 +2385,9 @@ Return JSON: {{"evaluation": "...", "strongest": "...", "weaknesses": ["..."], "
 Return ONLY JSON.""")
 
             if fb_response:
-                try:
-                    m = re.search(r'\{.*\}', fb_response, re.DOTALL)
-                    if m:
-                        ir['feedback'] = json.loads(m.group())
-                except:
-                    pass
+                parsed_fb = _extract_first_json(fb_response, dict)
+                if isinstance(parsed_fb, dict):
+                    ir['feedback'] = parsed_fb
 
         # Phase 5: Hypothesis lifecycle scoring
         if ir['hypotheses']:
@@ -2411,11 +2422,10 @@ What are the 2-3 most important insights?
 Return as JSON array of strings. Return ONLY JSON array.""")
 
         if syn_response:
-            try:
-                m = re.search(r'\[.*\]', syn_response, re.DOTALL)
-                if m:
-                    ir['insights'] = json.loads(m.group())
-            except:
+            parsed_syn = _extract_first_json(syn_response, list)
+            if isinstance(parsed_syn, list):
+                ir['insights'] = [i for i in parsed_syn if isinstance(i, str)]
+            else:
                 ir['insights'] = [syn_response[:200]]
 
         return ir
@@ -2441,26 +2451,22 @@ Return JSON array:
 Return ONLY JSON array."""
         response = self.llm.generate(prompt)
         if response:
-            try:
-                m = re.search(r'\[.*\]', response, re.DOTALL)
-                if m:
-                    items = json.loads(m.group())
-                    cleaned = []
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        cleaned.append({
-                            **item,
-                            'status': 'ranked',
-                            'testability_score': float(item.get('testability_score', 0.0)),
-                            'novelty_score': float(item.get('novelty_score', 0.0)),
-                            'falsifiability_score': float(item.get('falsifiability_score', 0.0)),
-                            'priority_score': float(item.get('priority_score', 0.0))
-                        })
-                    cleaned.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
-                    return cleaned[:4]
-            except (json.JSONDecodeError, KeyError, ValueError):
-                pass
+            items = _extract_first_json(response, list)
+            if isinstance(items, list):
+                cleaned = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    cleaned.append({
+                        **item,
+                        'status': 'ranked',
+                        'testability_score': float(item.get('testability_score', 0.0)),
+                        'novelty_score': float(item.get('novelty_score', 0.0)),
+                        'falsifiability_score': float(item.get('falsifiability_score', 0.0)),
+                        'priority_score': float(item.get('priority_score', 0.0))
+                    })
+                cleaned.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
+                return cleaned[:4]
         return []
 
     def _design_experiments(self, topic: str,
@@ -2488,26 +2494,22 @@ Return JSON array:
 Return ONLY JSON array."""
         response = self.llm.generate(prompt)
         if response:
-            try:
-                m = re.search(r'\[.*\]', response, re.DOTALL)
-                if m:
-                    data = json.loads(m.group())
-                    experiments = []
-                    for item in data:
-                        if isinstance(item, dict):
-                            experiments.append({
-                                'hypothesis': item.get('hypothesis', ''),
-                                'experiment': item.get('experiment', ''),
-                                'measurable_outcome': item.get('measurable_outcome', ''),
-                                'failure_signal': item.get('failure_signal', ''),
-                                'resources': item.get('resources', ''),
-                                'priority_score': float(item.get('priority_score', 0.0)),
-                                'status': 'experiment_designed'
-                            })
-                    if experiments:
-                        return experiments[:3]
-            except (json.JSONDecodeError, KeyError, ValueError):
-                pass
+            data = _extract_first_json(response, list)
+            if isinstance(data, list):
+                experiments = []
+                for item in data:
+                    if isinstance(item, dict):
+                        experiments.append({
+                            'hypothesis': item.get('hypothesis', ''),
+                            'experiment': item.get('experiment', ''),
+                            'measurable_outcome': item.get('measurable_outcome', ''),
+                            'failure_signal': item.get('failure_signal', ''),
+                            'resources': item.get('resources', ''),
+                            'priority_score': float(item.get('priority_score', 0.0)),
+                            'status': 'experiment_designed'
+                        })
+                if experiments:
+                    return experiments[:3]
         return []
 
     def _synthesize(self, topic: str, iterations: List[Dict]) -> Optional[str]:
@@ -2596,24 +2598,27 @@ class SynapseBrain:
         try:
             with open(self.run_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=True) + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  Warning: Failed to write run log ({e})")
 
     def _auto_save(self):
         """Save FAISS index. SQLite is already durable via write-through."""
         self.memory.save_vectors()
 
-    def _ensure_llm_available(self) -> Optional[Dict[str, Any]]:
-        if self.llm.is_available:
-            return None
-        return {'error': LLM_REQUIRED_ERROR}
+    def _ensure_services_available(self) -> Optional[Dict[str, Any]]:
+        if not self.llm.is_available:
+            return {'error': LLM_REQUIRED_ERROR}
+        if not self.embedder.available:
+            detail = f" Details: {self.embedder.error_message}" if self.embedder.error_message else ""
+            return {'error': EMBEDDINGS_REQUIRED_ERROR + detail}
+        return None
 
     def upload(self, doc_path: str,
                status_callback: Callable = None) -> Dict[str, Any]:
-        llm_err = self._ensure_llm_available()
-        if llm_err:
-            self._log_event("upload_error", {"doc_path": doc_path, "error": llm_err["error"]})
-            return llm_err
+        service_err = self._ensure_services_available()
+        if service_err:
+            self._log_event("upload_error", {"doc_path": doc_path, "error": service_err["error"]})
+            return service_err
         result = self.memory.extract_from_document(doc_path, status_callback)
         self._log_event("upload", {
             "doc_path": doc_path,
@@ -2631,10 +2636,10 @@ class SynapseBrain:
 
     def ask(self, question: str,
             status_callback: Callable = None) -> Dict[str, Any]:
-        llm_err = self._ensure_llm_available()
-        if llm_err:
-            self._log_event("ask_error", {"question": question, "error": llm_err["error"]})
-            return llm_err
+        service_err = self._ensure_services_available()
+        if service_err:
+            self._log_event("ask_error", {"question": question, "error": service_err["error"]})
+            return service_err
         result = self.qa.ask(question, status_callback)
         self._log_event("ask", {
             "question": question,
@@ -2650,10 +2655,10 @@ class SynapseBrain:
 
     def explore(self, topic: str, depth: int = 3,
                 status_callback: Callable = None) -> Dict[str, Any]:
-        llm_err = self._ensure_llm_available()
-        if llm_err:
-            self._log_event("explore_error", {"topic": topic, "depth": depth, "error": llm_err["error"]})
-            return llm_err
+        service_err = self._ensure_services_available()
+        if service_err:
+            self._log_event("explore_error", {"topic": topic, "depth": depth, "error": service_err["error"]})
+            return service_err
         result = self.explorer.explore(topic, depth, status_callback)
         first_iter = (result.get("iterations") or [{}])[0] if result.get("iterations") else {}
         self._log_event("explore", {
@@ -2669,6 +2674,10 @@ class SynapseBrain:
         return result
 
     def trace(self, query: str) -> Dict[str, Any]:
+        service_err = self._ensure_services_available()
+        if service_err:
+            self._log_event("trace_error", {"query": query, "error": service_err["error"]})
+            return {'found': False, 'message': service_err["error"]}
         return self.memory.trace(query)
 
     def get_stats(self) -> Dict[str, Any]:

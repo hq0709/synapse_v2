@@ -25,15 +25,16 @@ Environment variables:
 - `GEMINI_TOP_P`: nucleus sampling parameter.
 - `GEMINI_TOP_K`: top-k sampling parameter.
 - `GEMINI_MAX_OUTPUT_TOKENS`: output budget per call.
-- `GEMINI_EMBEDDING_MODELS`: comma-separated embedding model candidates (auto-fallback).
+- `GEMINI_EMBEDDING_MODEL`: fixed embedding model for all runs.
 - `SYNAPSE_AUTO_BACKFILL_EMBEDDINGS`: auto-embed legacy memories missing vectors at startup.
 - `SYNAPSE_MEMORY_DIR`: persistent memory directory (default `.synapse_memory`).
 
 ## LLM requirement
 
-Synapse now runs in strict LLM mode for scientific workflows:
-- `upload`, `ask`, and `explore` require a working LLM connection.
-- No offline fallback is used for extraction, reasoning, or exploration planning.
+Synapse now runs in strict model mode for scientific workflows:
+- `upload`, `ask`, `explore`, and `trace` require a working LLM connection.
+- Embeddings are required and pinned to one configured model (`GEMINI_EMBEDDING_MODEL`).
+- No offline fallback is used for extraction, reasoning, retrieval planning, or exploration.
 
 ## Audit logs
 
