@@ -22,6 +22,12 @@ Environment variables:
 - `GEMINI_API_KEY`: enables Gemini generation and embeddings.
 - `SYNAPSE_MEMORY_DIR`: persistent memory directory (default `.synapse_memory`).
 
+## LLM requirement
+
+Synapse now runs in strict LLM mode for scientific workflows:
+- `upload`, `ask`, and `explore` require a working LLM connection.
+- No offline fallback is used for extraction, reasoning, or exploration planning.
+
 ## Core commands
 
 ```text

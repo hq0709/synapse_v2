@@ -192,6 +192,10 @@ class Synapse:
         result = self.brain.ask(question, status_callback=on_status)
         spinner.stop()
 
+        if 'error' in result:
+            print(f"\n{C.D}Error: {result['error']}{C.R}\n")
+            return
+
         print(f"\n{C.B}Answer:{C.R}")
         print(result['answer'])
 
@@ -206,6 +210,17 @@ class Synapse:
 
         if result.get('sources'):
             print(f"{C.D}Sources: {', '.join(result['sources'][:3])}{C.R}")
+
+        contract = result.get('evidence_contract') or {}
+        coverage = contract.get('citation_coverage') or {}
+        if coverage:
+            cited = coverage.get('evidence_items_cited', 0)
+            total = coverage.get('evidence_items_total', 0)
+            sent_cited = coverage.get('sentences_with_citation', 0)
+            sent_total = coverage.get('sentences_total', 0)
+            print(f"{C.D}Evidence contract: cited evidence {cited}/{total} | citation sentences {sent_cited}/{sent_total}{C.R}")
+        if contract.get('reasoning_risks'):
+            print(f"{C.D}Risks: {contract['reasoning_risks'][0]}{C.R}")
 
         print()
 
@@ -272,6 +287,10 @@ class Synapse:
         result = self.brain.explore(topic, depth=depth, status_callback=on_status)
         spinner.stop()
 
+        if 'error' in result:
+            print(f"\n{C.D}Error: {result['error']}{C.R}\n")
+            return
+
         # Display results
         for it in result['iterations']:
             n = it['iteration']
@@ -292,6 +311,26 @@ class Synapse:
                             print(f"    {C.D}{hyp['rationale'][:120]}{C.R}")
                     elif isinstance(hyp, str):
                         print(f"  {C.W}{hyp}{C.R}")
+
+            if it.get('ranked_hypotheses'):
+                print(f"{C.L}Prioritized hypotheses:{C.R}")
+                for hyp in it['ranked_hypotheses'][:2]:
+                    if isinstance(hyp, dict):
+                        print(f"  {C.W}{hyp.get('hypothesis', '')[:130]}{C.R}")
+                        p = hyp.get('priority_score', 0.0)
+                        t = hyp.get('testability_score', 0.0)
+                        f = hyp.get('falsifiability_score', 0.0)
+                        print(f"    {C.D}priority={p:.2f}, testability={t:.2f}, falsifiability={f:.2f}{C.R}")
+
+            if it.get('experiments'):
+                print(f"{C.L}Experiment plans:{C.R}")
+                for exp in it['experiments'][:2]:
+                    if isinstance(exp, dict):
+                        print(f"  {C.W}{exp.get('experiment', '')[:140]}{C.R}")
+                        if exp.get('measurable_outcome'):
+                            print(f"    {C.D}Metric: {exp['measurable_outcome'][:100]}{C.R}")
+                        if exp.get('failure_signal'):
+                            print(f"    {C.D}Failure signal: {exp['failure_signal'][:100]}{C.R}")
 
             if it.get('feedback') and isinstance(it['feedback'], dict):
                 fb = it['feedback']

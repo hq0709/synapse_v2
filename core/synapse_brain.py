@@ -68,6 +68,10 @@ _load_env_file(PROJECT_ROOT / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MEMORY_DIR = os.getenv("SYNAPSE_MEMORY_DIR", ".synapse_memory")
+LLM_REQUIRED_ERROR = (
+    "LLM is required but unavailable. Please install dependencies and set "
+    "GEMINI_API_KEY in .env."
+)
 
 
 # ======================== Data Structures ========================
@@ -867,7 +871,7 @@ class MemorySystem:
 
         coverage_excerpt = self._build_coverage_excerpt(chunks, max_chunks=4, chunk_chars=1200)
         if not self.llm.is_available:
-            return coverage_excerpt
+            return ""
 
         chunk_notes = []
         for idx, chunk in enumerate(chunks[:8]):
@@ -941,6 +945,8 @@ Document-level overview:"""
 
     def extract_from_document(self, doc_path: str,
                               status_callback: Callable = None) -> Dict[str, Any]:
+        if not self.llm.is_available:
+            return {'error': LLM_REQUIRED_ERROR}
         try:
             with open(doc_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -1018,10 +1024,9 @@ Document-level overview:"""
         if not chunks:
             return []
 
-        if self.llm.is_available:
-            all_facts: List[Tuple[str, str]] = []
-            for idx, chunk in enumerate(chunks[:12]):
-                prompt = f"""You are a scientific knowledge extractor. Extract atomic facts from this chunk ({idx+1}/{len(chunks)}).
+        all_facts: List[Tuple[str, str]] = []
+        for idx, chunk in enumerate(chunks[:12]):
+            prompt = f"""You are a scientific knowledge extractor. Extract atomic facts from this chunk ({idx+1}/{len(chunks)}).
 
 RULES (atomicity enforcement):
 - Each fact MUST be a single, independent, verifiable statement
@@ -1038,41 +1043,21 @@ Return as JSON array:
 [{{"fact": "...", "evidence": "exact quote or paraphrase from document", "section": "which section"}}]
 Return ONLY the JSON array."""
 
-                response = self.llm.generate(prompt)
-                self._incr_stat('llm_calls_for_memory')
-                if not response:
-                    continue
-                try:
-                    json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                    if not json_match:
-                        continue
-                    facts_data = json.loads(json_match.group())
-                    for item in facts_data:
-                        if isinstance(item, dict) and 'fact' in item:
-                            all_facts.append((item['fact'], item.get('evidence', '')))
-                except (json.JSONDecodeError, KeyError):
-                    continue
-            deduped = self._dedupe_fact_pairs(all_facts, max_items=24)
-            if deduped:
-                return deduped
-
-        fallback_facts: List[Tuple[str, str]] = []
-        for chunk in chunks:
-            fallback_facts.extend(self._extract_facts_rule_based(chunk, source))
-        return self._dedupe_fact_pairs(fallback_facts, max_items=18)
-
-    def _extract_facts_rule_based(self, content: str, source: str) -> List[Tuple[str, str]]:
-        facts = []
-        sentences = re.split(r'[.!?]+', content)
-        for sent in sentences:
-            sent = sent.strip()
-            if len(sent) < 20 or len(sent) > 300:
+            response = self.llm.generate(prompt)
+            self._incr_stat('llm_calls_for_memory')
+            if not response:
                 continue
-            if any(kw in sent.lower() for kw in
-                   ['found', 'showed', 'demonstrated', 'achieved', 'improved',
-                    'increased', 'decreased', 'results', 'method', 'approach']):
-                facts.append((sent, f"Extracted from {source}"))
-        return facts[:15]
+            try:
+                json_match = re.search(r'\[.*\]', response, re.DOTALL)
+                if not json_match:
+                    continue
+                facts_data = json.loads(json_match.group())
+                for item in facts_data:
+                    if isinstance(item, dict) and 'fact' in item:
+                        all_facts.append((item['fact'], item.get('evidence', '')))
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return self._dedupe_fact_pairs(all_facts, max_items=24)
 
     def _auto_connect(self, memcell_ids: List[str]):
         """Connect MemCells by semantic similarity + keyword overlap."""
@@ -1101,9 +1086,7 @@ Return ONLY the JSON array."""
         episode_id = self._gen_id(f"episode_{source}_{datetime.now()}")
         chunks = chunks or self._chunk_text(content)
         doc_summary = doc_summary or self._build_hierarchical_document_summary(chunks)
-
-        if self.llm.is_available:
-            prompt = f"""Construct a research episode narrative from chunk-level notes and global summary.
+        prompt = f"""Construct a research episode narrative from chunk-level notes and global summary.
 
 Return JSON:
 {{
@@ -1120,51 +1103,37 @@ Coverage excerpt:
 
 Return ONLY JSON."""
 
-            response = self.llm.generate(prompt)
-            self._incr_stat('llm_calls_for_memory')
-            if response:
-                try:
-                    json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group())
-                        episode = Episode(
-                            id=episode_id,
-                            subject=data.get('subject', 'Research Document'),
-                            summary=data.get('summary', ''),
-                            narrative=data.get('narrative', ''),
-                            memcell_ids=memcell_ids,
-                            timestamp=datetime.now(),
-                            keywords=self._tokenize(
-                                data.get('subject', '') + ' ' + data.get('summary', ''))
-                        )
-                        self.episodes[episode_id] = episode
-                        self._incr_stat('total_episodes')
-                        self.bm25.add_document(f"ep_{episode_id}", episode.keywords)
-                        if self.db:
-                            self.db.insert_episode(episode)
-                        return episode
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-        fallback_excerpt = self._build_coverage_excerpt(chunks, max_chunks=3, chunk_chars=350)
-        episode = Episode(
-            id=episode_id, subject=f"Document: {Path(source).stem}",
-            summary=fallback_excerpt[:240], narrative=fallback_excerpt[:900],
-            memcell_ids=memcell_ids, timestamp=datetime.now(),
-            keywords=self._tokenize(fallback_excerpt[:300])
-        )
-        self.episodes[episode_id] = episode
-        self._incr_stat('total_episodes')
-        self.bm25.add_document(f"ep_{episode_id}", episode.keywords)
-        if self.db:
-            self.db.insert_episode(episode)
-        return episode
+        response = self.llm.generate(prompt)
+        self._incr_stat('llm_calls_for_memory')
+        if not response:
+            return None
+        try:
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                return None
+            data = json.loads(json_match.group())
+            episode = Episode(
+                id=episode_id,
+                subject=data.get('subject', 'Research Document'),
+                summary=data.get('summary', ''),
+                narrative=data.get('narrative', ''),
+                memcell_ids=memcell_ids,
+                timestamp=datetime.now(),
+                keywords=self._tokenize(
+                    data.get('subject', '') + ' ' + data.get('summary', ''))
+            )
+            self.episodes[episode_id] = episode
+            self._incr_stat('total_episodes')
+            self.bm25.add_document(f"ep_{episode_id}", episode.keywords)
+            if self.db:
+                self.db.insert_episode(episode)
+            return episode
+        except (json.JSONDecodeError, KeyError):
+            return None
 
     def _extract_foresight(self, content: str, source: str, memcell_ids: List[str],
                            chunks: Optional[List[str]] = None,
                            doc_summary: Optional[str] = None):
-        if not self.llm.is_available:
-            return
         chunks = chunks or self._chunk_text(content)
         doc_summary = doc_summary or self._build_hierarchical_document_summary(chunks)
         prompt = f"""Based on this research, predict 2-3 future research directions.
@@ -1204,25 +1173,21 @@ Return ONLY JSON array."""
                         doc_summary: Optional[str] = None) -> List[str]:
         chunks = chunks or self._chunk_text(content)
         doc_summary = doc_summary or self._build_hierarchical_document_summary(chunks)
-        if self.llm.is_available:
-            prompt = f"""What are the 2-3 main research topics in this document?
+        prompt = f"""What are the 2-3 main research topics in this document?
 Return as JSON array of strings. Return ONLY the JSON array.
 Document summary: {doc_summary[:1800]}
 Coverage excerpt:
 {self._build_coverage_excerpt(chunks, max_chunks=3, chunk_chars=700)}"""
-            response = self.llm.generate(prompt)
-            self._incr_stat('llm_calls_for_memory')
-            if response:
-                try:
-                    json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                    if json_match:
-                        return json.loads(json_match.group())
-                except:
-                    pass
-        coverage_excerpt = self._build_coverage_excerpt(
-            chunks, max_chunks=3, chunk_chars=700, include_headers=False
-        )
-        return self._tokenize(coverage_excerpt)[:3]
+        response = self.llm.generate(prompt)
+        self._incr_stat('llm_calls_for_memory')
+        if response:
+            try:
+                json_match = re.search(r'\[.*\]', response, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+            except:
+                pass
+        return []
 
     def _update_profile(self, topic: str, memcell_ids: List[str]):
         if topic not in self.profiles:
@@ -1346,7 +1311,8 @@ Return ONLY JSON."""
 
     def _store_memcell(self, content: str, memory_type: MemoryType,
                        evidence: List[Evidence], source_doc: str = None,
-                       source_section: str = None, importance: float = 0.5) -> MemCell:
+                       source_section: str = None, importance: float = 0.5,
+                       metadata: Optional[Dict[str, Any]] = None) -> MemCell:
         mem_id = self._gen_id(content + str(datetime.now()))
         keywords = self._tokenize(content)
 
@@ -1357,7 +1323,8 @@ Return ONLY JSON."""
             id=mem_id, memory_type=memory_type, content=content,
             evidence=evidence, source_doc=source_doc,
             source_section=source_section, timestamp=datetime.now(),
-            keywords=keywords, embedding=embedding, importance=importance
+            keywords=keywords, embedding=embedding, importance=importance,
+            metadata=metadata or {}
         )
 
         # In-memory
@@ -1560,8 +1527,10 @@ Return ONLY JSON."""
         """
         initial_results = self._hybrid_retrieval(query, query_keywords, top_k, allowed_types)
 
-        if not self.llm.is_available or not initial_results:
+        if not initial_results:
             return initial_results
+        if not self.llm.is_available:
+            return []
 
         context = "\n".join([f"- {mem.content}" for mem, _ in initial_results[:5]])
         prompt = f"""Assess if this information is sufficient to answer the question.
@@ -1811,7 +1780,7 @@ class QAEngine:
         # Step 1: Retrieve
         if status_callback:
             status_callback("Retrieving memories")
-        strategy = "agentic" if self.llm.is_available else "hybrid"
+        strategy = "agentic"
         retrieved = self.memory.retrieve(
             question,
             top_k=10,
@@ -1829,7 +1798,7 @@ class QAEngine:
         answer, mode = self._generate_scientist_answer(question, context, has_memory)
 
         # Step 4: Self-feedback → refine
-        if self.llm.is_available and answer and has_memory:
+        if answer and has_memory:
             if status_callback:
                 status_callback("Self-evaluation")
             feedback = self._get_feedback(question, context, answer)
@@ -1841,13 +1810,19 @@ class QAEngine:
                 answer = self._refine_answer(question, full_ctx, answer, feedback)
 
         # Step 5: Sentence-level citation verification
-        if self.llm.is_available and answer and has_memory:
+        if answer and has_memory:
             if status_callback:
                 status_callback("Verifying citations")
             answer = self._verify_citations_sentence_level(answer, context)
 
+        evidence_contract = self._build_evidence_contract(
+            question=question,
+            answer=answer or "",
+            retrieved=retrieved
+        )
+
         # Step 6: Store
-        self._store_qa(question, answer, retrieved)
+        self._store_qa(question, answer, retrieved, evidence_contract)
 
         return {
             'answer': answer or "I need more information. Try uploading relevant documents.",
@@ -1857,7 +1832,8 @@ class QAEngine:
                           'confidence': mem.evidence[0].confidence if mem.evidence else 0.5}
                          for mem, _ in retrieved[:3]],
             'elapsed': time.time() - start_time,
-            'mode': mode
+            'mode': mode,
+            'evidence_contract': evidence_contract
         }
 
     def _format_context(self, retrieved: List[Tuple[MemCell, float]]) -> str:
@@ -1871,11 +1847,6 @@ class QAEngine:
 
     def _generate_scientist_answer(self, question: str, context: str,
                                    has_memory: bool) -> Tuple[Optional[str], str]:
-        if not self.llm.is_available:
-            if context:
-                return f"Based on stored knowledge:\n{context}", "memory-only"
-            return None, "offline"
-
         history_text = ""
         if self.conversation_history:
             recent = self.conversation_history[-3:]
@@ -2000,7 +1971,133 @@ Return ONLY the corrected answer text."""
         verified = self.llm.generate(prompt)
         return verified if verified else answer
 
-    def _store_qa(self, question: str, answer: str, retrieved: List):
+    def _split_sentences(self, text: str) -> List[str]:
+        parts = re.split(r'(?<=[.!?])\s+', text.strip())
+        return [p.strip() for p in parts if p.strip()]
+
+    def _build_evidence_contract(self, question: str, answer: str,
+                                 retrieved: List[Tuple[MemCell, float]]) -> Dict[str, Any]:
+        evidence_items = []
+        for idx, (mem, score) in enumerate(retrieved[:8]):
+            evidence_items.append({
+                'index': idx,
+                'memcell_id': mem.id,
+                'memory_type': mem.memory_type.value,
+                'source': mem.source_doc or "memory",
+                'relevance': round(float(score), 4),
+                'confidence': round(mem.evidence[0].confidence, 3) if mem.evidence else 0.5,
+                'excerpt': mem.content[:180]
+            })
+
+        cited_indices = {
+            int(x) for x in re.findall(r'\[(\d+)\]', answer)
+            if x.isdigit() and int(x) < len(evidence_items)
+        }
+        cited_evidence = [item for item in evidence_items if item['index'] in cited_indices]
+
+        sentences = self._split_sentences(answer)
+        cited_sentence_count = 0
+        for sent in sentences:
+            if re.search(r'\[\d+\]', sent):
+                cited_sentence_count += 1
+
+        assumptions = []
+        hedge_hits = re.findall(r'\b(may|might|could|likely|possible|possibly)\b', answer.lower())
+        if hedge_hits:
+            assumptions.append("Answer includes inferential language and should be treated as a hypothesis.")
+        if not cited_evidence and retrieved:
+            assumptions.append("No explicit citation anchors were detected in answer sentences.")
+
+        reasoning_risks = []
+        if not retrieved:
+            reasoning_risks.append("No memory evidence retrieved; answer relies on generic expertise.")
+        if retrieved and not cited_evidence:
+            reasoning_risks.append("Retrieved evidence exists but none was explicitly cited.")
+        if len(cited_indices) < max(1, len(sentences) // 3):
+            reasoning_risks.append("Citation coverage is sparse relative to answer length.")
+
+        follow_up = []
+        if retrieved:
+            follow_up.append("Validate strongest claim against the top-ranked source passage.")
+        if reasoning_risks:
+            follow_up.append("Run targeted retrieval for missing claims and regenerate answer.")
+
+        contract = {
+            'question': question,
+            'evidence_items': evidence_items,
+            'cited_evidence': cited_evidence,
+            'assumptions': assumptions,
+            'reasoning_risks': reasoning_risks,
+            'follow_up_checks': follow_up,
+            'citation_coverage': {
+                'sentences_total': len(sentences),
+                'sentences_with_citation': cited_sentence_count,
+                'evidence_items_total': len(evidence_items),
+                'evidence_items_cited': len(cited_evidence)
+            }
+        }
+
+        if retrieved and answer:
+            llm_contract = self._llm_contract_review(question, answer, retrieved)
+            if llm_contract:
+                if isinstance(llm_contract.get('assumptions'), list):
+                    contract['assumptions'].extend(
+                        [a for a in llm_contract['assumptions'] if isinstance(a, str)]
+                    )
+                if isinstance(llm_contract.get('reasoning_risks'), list):
+                    contract['reasoning_risks'].extend(
+                        [r for r in llm_contract['reasoning_risks'] if isinstance(r, str)]
+                    )
+                if isinstance(llm_contract.get('follow_up_checks'), list):
+                    contract['follow_up_checks'].extend(
+                        [f for f in llm_contract['follow_up_checks'] if isinstance(f, str)]
+                    )
+
+        # Stable dedupe keeps output compact and deterministic.
+        for key in ('assumptions', 'reasoning_risks', 'follow_up_checks'):
+            deduped = []
+            seen = set()
+            for item in contract[key]:
+                norm = re.sub(r'\s+', ' ', item.strip())
+                if not norm:
+                    continue
+                if norm.lower() in seen:
+                    continue
+                seen.add(norm.lower())
+                deduped.append(norm)
+            contract[key] = deduped[:6]
+        return contract
+
+    def _llm_contract_review(self, question: str, answer: str,
+                             retrieved: List[Tuple[MemCell, float]]) -> Optional[Dict[str, Any]]:
+        context = self._format_context(retrieved[:6])
+        prompt = f"""Create an evidence contract review for this scientific answer.
+
+Question: {question}
+Evidence context:
+{context[:1800]}
+Answer:
+{answer[:1600]}
+
+Return JSON only:
+{{
+  "assumptions": ["2-4 assumptions in answer"],
+  "reasoning_risks": ["2-4 risks or unsupported leaps"],
+  "follow_up_checks": ["2-4 concrete verification actions"]
+}}"""
+        response = self.llm.generate(prompt)
+        if not response:
+            return None
+        try:
+            match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not match:
+                return None
+            return json.loads(match.group())
+        except (json.JSONDecodeError, KeyError):
+            return None
+
+    def _store_qa(self, question: str, answer: str, retrieved: List,
+                  evidence_contract: Optional[Dict[str, Any]] = None):
         if not answer:
             return
         self.memory._store_memcell(
@@ -2008,7 +2105,15 @@ Return ONLY the corrected answer text."""
             memory_type=MemoryType.QA_PAIR,
             evidence=[Evidence(content=question, source="conversation",
                                type="direct", confidence=0.7)],
-            importance=0.6
+            importance=0.6,
+            metadata={
+                'contract': {
+                    'assumptions': (evidence_contract or {}).get('assumptions', []),
+                    'reasoning_risks': (evidence_contract or {}).get('reasoning_risks', []),
+                    'follow_up_checks': (evidence_contract or {}).get('follow_up_checks', []),
+                    'cited_evidence_count': (evidence_contract or {}).get('citation_coverage', {}).get('evidence_items_cited', 0),
+                }
+            }
         )
         self.conversation_history.append({
             'question': question, 'answer': answer,
@@ -2020,6 +2125,7 @@ Return ONLY the corrected answer text."""
 
 class ScientificExplorer:
     """Deep exploration with evidence-chain hypotheses."""
+    EVIDENCE_TYPES = {MemoryType.ATOMIC_FACT, MemoryType.EPISODE}
 
     def __init__(self, memory: MemorySystem, llm: LLMProvider):
         self.memory = memory
@@ -2049,7 +2155,36 @@ class ScientificExplorer:
                     evidence=[Evidence(
                         content=f"Exploration of {topic}, iteration {i+1}",
                         source="exploration", type="inferred", confidence=0.6)],
-                    importance=0.7
+                    importance=0.7,
+                    metadata={
+                        'lifecycle': 'insight',
+                        'topic': topic,
+                        'iteration': i + 1
+                    }
+                )
+            for exp in ir.get('experiments', [])[:2]:
+                hypothesis = exp.get('hypothesis', '')
+                plan = exp.get('experiment', '')
+                metric = exp.get('measurable_outcome', '')
+                content = (
+                    f"[Experiment Plan] {hypothesis}\n"
+                    f"Plan: {plan}\n"
+                    f"Outcome metric: {metric}"
+                ).strip()
+                self.memory._store_memcell(
+                    content=content,
+                    memory_type=MemoryType.FORESIGHT,
+                    evidence=[Evidence(
+                        content=f"Exploration experiment design for {topic}, iteration {i+1}",
+                        source="exploration", type="inferred", confidence=0.65)],
+                    importance=0.72,
+                    metadata={
+                        'lifecycle': 'experiment_plan',
+                        'topic': topic,
+                        'iteration': i + 1,
+                        'priority_score': exp.get('priority_score', 0.0),
+                        'failure_signal': exp.get('failure_signal', '')
+                    }
                 )
 
         if status_callback:
@@ -2063,25 +2198,43 @@ class ScientificExplorer:
             memory_type=MemoryType.EPISODE,
             evidence=[Evidence(content=f"Synthesis from {depth}-iteration exploration",
                                source="exploration", type="inferred", confidence=0.7)],
-            importance=0.8
+            importance=0.8,
+            metadata={
+                'lifecycle': 'synthesis',
+                'topic': topic,
+                'iterations': depth
+            }
         )
         return result
 
     def _run_iteration(self, topic: str, iteration: int, total: int,
                        accumulated: List[str],
                        status_callback: Callable = None) -> Dict[str, Any]:
-        ir = {'iteration': iteration, 'gaps': [], 'hypotheses': [], 'insights': [], 'feedback': None}
+        ir = {
+            'iteration': iteration,
+            'gaps': [],
+            'hypotheses': [],
+            'ranked_hypotheses': [],
+            'experiments': [],
+            'insights': [],
+            'feedback': None
+        }
 
         # Phase 1: Literature review
         if status_callback:
             status_callback(f"Iteration {iteration}/{total}: Reviewing literature")
-        retrieved = self.memory.retrieve(topic, top_k=15, strategy="hybrid")
+        retrieved = self.memory.retrieve(
+            topic,
+            top_k=15,
+            strategy="hybrid",
+            allowed_types=self.EVIDENCE_TYPES
+        )
+        retrieved = [
+            (mem, score) for mem, score in retrieved
+            if mem.metadata.get('lifecycle') not in {'synthesis', 'experiment_plan'}
+        ]
         knowledge = "\n".join([f"[{i}] {mem.content}" for i, (mem, _) in enumerate(retrieved)])
         acc_text = "\n".join([f"- {a}" for a in accumulated[-5:]])
-
-        if not self.llm.is_available:
-            ir['insights'] = [f"Retrieved {len(retrieved)} items about {topic}"]
-            return ir
 
         # Phase 2: Gap analysis
         if status_callback:
@@ -2147,13 +2300,34 @@ Return ONLY JSON.""")
                 except:
                     pass
 
-        # Phase 5: Synthesize
+        # Phase 5: Hypothesis lifecycle scoring
+        if ir['hypotheses']:
+            if status_callback:
+                status_callback(f"Iteration {iteration}/{total}: Scoring hypotheses")
+            ir['ranked_hypotheses'] = self._score_hypotheses(
+                topic=topic,
+                hypotheses=ir['hypotheses'],
+                knowledge=knowledge
+            )
+
+        # Phase 6: Design minimum viable experiments
+        if ir['ranked_hypotheses']:
+            if status_callback:
+                status_callback(f"Iteration {iteration}/{total}: Designing experiments")
+            ir['experiments'] = self._design_experiments(
+                topic=topic,
+                ranked_hypotheses=ir['ranked_hypotheses']
+            )
+
+        # Phase 7: Synthesize
         if status_callback:
             status_callback(f"Iteration {iteration}/{total}: Synthesizing")
 
         syn_response = self.llm.generate(f"""Based on this exploration iteration of "{topic}":
 Gaps: {json.dumps(ir['gaps'])}
 Hypotheses: {json.dumps(ir['hypotheses'][:2])}
+Ranked hypotheses: {json.dumps(ir['ranked_hypotheses'][:2])}
+Experiment plans: {json.dumps(ir['experiments'][:2])}
 Evaluation: {json.dumps(ir.get('feedback', {}))}
 What are the 2-3 most important insights?
 Return as JSON array of strings. Return ONLY JSON array.""")
@@ -2168,27 +2342,118 @@ Return as JSON array of strings. Return ONLY JSON array.""")
 
         return ir
 
-    def _synthesize(self, topic: str, iterations: List[Dict]) -> Optional[str]:
-        if not self.llm.is_available:
-            return f"Exploration of {topic} completed ({len(iterations)} iterations)."
+    def _score_hypotheses(self, topic: str, hypotheses: List[Dict[str, Any]],
+                          knowledge: str) -> List[Dict[str, Any]]:
+        if not hypotheses:
+            return []
 
-        all_insights, all_hyps, all_gaps = [], [], []
+        prompt = f"""Score hypotheses for scientific discovery planning.
+For each hypothesis, assign scores in [0,1]:
+- testability_score: can it be tested with concrete measurements?
+- novelty_score: non-obvious contribution relative to current knowledge.
+- falsifiability_score: can it be disproved clearly?
+- priority_score: overall priority for next experiments.
+
+Topic: {topic}
+Knowledge: {knowledge[:1500]}
+Hypotheses: {json.dumps(hypotheses[:5], ensure_ascii=True)}
+
+Return JSON array:
+[{{"hypothesis":"...", "testability_score":0.0, "novelty_score":0.0, "falsifiability_score":0.0, "priority_score":0.0, "status":"ranked"}}]
+Return ONLY JSON array."""
+        response = self.llm.generate(prompt)
+        if response:
+            try:
+                m = re.search(r'\[.*\]', response, re.DOTALL)
+                if m:
+                    items = json.loads(m.group())
+                    cleaned = []
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        cleaned.append({
+                            **item,
+                            'status': 'ranked',
+                            'testability_score': float(item.get('testability_score', 0.0)),
+                            'novelty_score': float(item.get('novelty_score', 0.0)),
+                            'falsifiability_score': float(item.get('falsifiability_score', 0.0)),
+                            'priority_score': float(item.get('priority_score', 0.0))
+                        })
+                    cleaned.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
+                    return cleaned[:4]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+        return []
+
+    def _design_experiments(self, topic: str,
+                            ranked_hypotheses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not ranked_hypotheses:
+            return []
+        top = ranked_hypotheses[:3]
+
+        prompt = f"""Design minimum viable experiments for top-ranked hypotheses on "{topic}".
+Each experiment must include measurable outcome and failure signal.
+
+Hypotheses:
+{json.dumps(top, ensure_ascii=True)}
+
+Return JSON array:
+[{{
+  "hypothesis":"...",
+  "experiment":"stepwise minimal experiment design",
+  "measurable_outcome":"quantitative metric",
+  "failure_signal":"what falsifies the hypothesis",
+  "resources":"minimal resources required",
+  "priority_score":0.0,
+  "status":"experiment_designed"
+}}]
+Return ONLY JSON array."""
+        response = self.llm.generate(prompt)
+        if response:
+            try:
+                m = re.search(r'\[.*\]', response, re.DOTALL)
+                if m:
+                    data = json.loads(m.group())
+                    experiments = []
+                    for item in data:
+                        if isinstance(item, dict):
+                            experiments.append({
+                                'hypothesis': item.get('hypothesis', ''),
+                                'experiment': item.get('experiment', ''),
+                                'measurable_outcome': item.get('measurable_outcome', ''),
+                                'failure_signal': item.get('failure_signal', ''),
+                                'resources': item.get('resources', ''),
+                                'priority_score': float(item.get('priority_score', 0.0)),
+                                'status': 'experiment_designed'
+                            })
+                    if experiments:
+                        return experiments[:3]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+        return []
+
+    def _synthesize(self, topic: str, iterations: List[Dict]) -> Optional[str]:
+        all_insights, all_hyps, all_gaps, all_ranked, all_experiments = [], [], [], [], []
         for it in iterations:
             all_insights.extend(it.get('insights', []))
             all_hyps.extend(it.get('hypotheses', []))
             all_gaps.extend(it.get('gaps', []))
+            all_ranked.extend(it.get('ranked_hypotheses', []))
+            all_experiments.extend(it.get('experiments', []))
 
         return self.llm.generate(f"""Write a scientific synthesis of exploring "{topic}" ({len(iterations)} iterations).
 
 Insights: {json.dumps(all_insights)}
 Hypotheses: {json.dumps(all_hyps[:6])}
+Ranked hypotheses: {json.dumps(all_ranked[:6])}
+Experiment plans: {json.dumps(all_experiments[:6])}
 Gaps: {json.dumps(all_gaps[:6])}
 
 Write 3-4 paragraphs:
 1. Current state of knowledge
 2. Strongest hypotheses with evidence
-3. Critical remaining gaps
-4. Prioritized next steps
+3. High-priority experiments and failure criteria
+4. Critical remaining gaps and next steps
 
 Write as a scientist at a research meeting — authoritative, precise, forward-looking.""")
 
@@ -2230,8 +2495,16 @@ class SynapseBrain:
         """Save FAISS index. SQLite is already durable via write-through."""
         self.memory.save_vectors()
 
+    def _ensure_llm_available(self) -> Optional[Dict[str, Any]]:
+        if self.llm.is_available:
+            return None
+        return {'error': LLM_REQUIRED_ERROR}
+
     def upload(self, doc_path: str,
                status_callback: Callable = None) -> Dict[str, Any]:
+        llm_err = self._ensure_llm_available()
+        if llm_err:
+            return llm_err
         result = self.memory.extract_from_document(doc_path, status_callback)
         if 'error' not in result:
             if status_callback:
@@ -2241,12 +2514,18 @@ class SynapseBrain:
 
     def ask(self, question: str,
             status_callback: Callable = None) -> Dict[str, Any]:
+        llm_err = self._ensure_llm_available()
+        if llm_err:
+            return llm_err
         result = self.qa.ask(question, status_callback)
         self._auto_save()
         return result
 
     def explore(self, topic: str, depth: int = 3,
                 status_callback: Callable = None) -> Dict[str, Any]:
+        llm_err = self._ensure_llm_available()
+        if llm_err:
+            return llm_err
         result = self.explorer.explore(topic, depth, status_callback)
         self._auto_save()
         return result
