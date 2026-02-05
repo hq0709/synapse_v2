@@ -1,0 +1,22 @@
+# Local secrets and environment
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local virtual environment
+.venv/
+
+# Runtime data
+.synapse_memory/
+
+# OS files
+.DS_Store
+
+# Reference repositories (kept locally, not part of this submission repo)
+EverMemOS/
+OpenScholar/
+old_versions/
