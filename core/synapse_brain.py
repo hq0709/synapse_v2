@@ -68,6 +68,20 @@ _load_env_file(PROJECT_ROOT / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MEMORY_DIR = os.getenv("SYNAPSE_MEMORY_DIR", ".synapse_memory")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
+GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.95"))
+GEMINI_TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
+EMBEDDING_MODELS = [
+    m.strip() for m in os.getenv(
+        "GEMINI_EMBEDDING_MODELS",
+        "models/text-embedding-004,models/embedding-001"
+    ).split(",") if m.strip()
+]
+SYNAPSE_AUTO_BACKFILL_EMBEDDINGS = os.getenv(
+    "SYNAPSE_AUTO_BACKFILL_EMBEDDINGS", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 LLM_REQUIRED_ERROR = (
     "LLM is required but unavailable. Please install dependencies and set "
     "GEMINI_API_KEY in .env."
@@ -193,18 +207,26 @@ class EmbeddingProvider:
     """Gemini text-embedding-004: 768D embeddings for semantic retrieval."""
     def __init__(self, api_key: str = None):
         self.available = False
+        self.model_name: Optional[str] = None
         if api_key and genai:
             try:
                 genai.configure(api_key=api_key)
-                # Test embedding
-                result = genai.embed_content(
-                    model='models/text-embedding-004',
-                    content='test',
-                    task_type='RETRIEVAL_DOCUMENT'
-                )
-                self.dim = len(result['embedding'])
-                self.available = True
-                print(f"  Embeddings: Gemini {self.dim}D connected")
+                for model_name in EMBEDDING_MODELS:
+                    try:
+                        result = genai.embed_content(
+                            model=model_name,
+                            content='test',
+                            task_type='RETRIEVAL_DOCUMENT'
+                        )
+                        self.dim = len(result['embedding'])
+                        self.model_name = model_name
+                        self.available = True
+                        print(f"  Embeddings: Gemini {self.dim}D connected ({model_name})")
+                        break
+                    except Exception:
+                        continue
+                if not self.available:
+                    print("  Embeddings: Failed (no configured embedding model available)")
             except Exception as e:
                 print(f"  Embeddings: Failed ({e})")
         else:
@@ -215,7 +237,7 @@ class EmbeddingProvider:
             return None
         try:
             result = genai.embed_content(
-                model='models/text-embedding-004',
+                model=self.model_name,
                 content=text[:2000],
                 task_type='RETRIEVAL_DOCUMENT'
             )
@@ -228,7 +250,7 @@ class EmbeddingProvider:
             return None
         try:
             result = genai.embed_content(
-                model='models/text-embedding-004',
+                model=self.model_name,
                 content=text[:2000],
                 task_type='RETRIEVAL_QUERY'
             )
@@ -677,11 +699,19 @@ class LLMProvider:
     def __init__(self, api_key: str = None):
         self.model = None
         self.call_count = 0
+        self.model_name = GEMINI_MODEL
+        self.generation_config = {
+            "temperature": GEMINI_TEMPERATURE,
+            "top_p": GEMINI_TOP_P,
+            "top_k": GEMINI_TOP_K,
+            "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
+            "candidate_count": 1,
+        }
         if api_key and genai:
             try:
                 genai.configure(api_key=api_key)
-                self.model = genai.GenerativeModel('gemini-2.0-flash')
-                print("  LLM: Gemini connected")
+                self.model = genai.GenerativeModel(self.model_name)
+                print(f"  LLM: Gemini connected ({self.model_name}, temp={GEMINI_TEMPERATURE})")
             except Exception as e:
                 print(f"  LLM: Failed ({e})")
         else:
@@ -692,7 +722,10 @@ class LLMProvider:
             return None
         for attempt in range(max_retries):
             try:
-                response = self.model.generate_content(prompt)
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config=self.generation_config
+                )
                 self.call_count += 1
                 if response and response.text:
                     return response.text.strip()
@@ -1619,6 +1652,51 @@ Return ONLY JSON."""
             ids_path = os.path.join(self.storage_dir, 'vector_ids.json')
             self.faiss_vectors.save(idx_path, ids_path)
 
+    def backfill_vectors(self, max_items: int = 5000) -> Dict[str, int]:
+        """
+        Rebuild missing vectors for existing memories using current embedder.
+        Useful when legacy data was loaded without a FAISS index.
+        """
+        if not self.embedder.available:
+            return {"checked": 0, "embedded": 0, "failed": 0}
+
+        has_faiss = bool(self.faiss_vectors and self.faiss_vectors.index is not None)
+        checked = embedded = failed = 0
+        for mem in self.memcells.values():
+            if checked >= max_items:
+                break
+            checked += 1
+            if has_faiss and self.faiss_vectors.contains(mem.id):
+                continue
+            if (not has_faiss) and mem.id in self.vectors.embeddings:
+                continue
+            emb = self.embedder.embed_document(mem.content)
+            if emb is None:
+                failed += 1
+                continue
+            mem.embedding = emb
+            added = False
+            if has_faiss:
+                self.faiss_vectors.add(mem.id, emb)
+                added = self.faiss_vectors.contains(mem.id)
+            else:
+                self.vectors.add(mem.id, emb)
+                added = mem.id in self.vectors.embeddings
+
+            if not added:
+                failed += 1
+                continue
+            if self.db and has_faiss:
+                self.db.conn.execute(
+                    "UPDATE memcells SET has_embedding=1 WHERE id=?", (mem.id,))
+            embedded += 1
+
+        if self.db and has_faiss:
+            self.db.conn.commit()
+        if embedded > 0 and has_faiss:
+            self.save_vectors()
+        return {"checked": checked, "embedded": embedded, "failed": failed}
+
     def migrate_from_json(self, directory: str) -> bool:
         """One-time migration: read old JSON files into SQLite + FAISS."""
         memcells_path = os.path.join(directory, 'memcells.json')
@@ -2469,6 +2547,7 @@ class SynapseBrain:
         # Storage directory
         self.memory_dir = os.path.join(os.getcwd(), MEMORY_DIR)
         os.makedirs(self.memory_dir, exist_ok=True)
+        self._init_run_logging()
 
         # Create MemorySystem with SQLite + FAISS backend
         self.memory = MemorySystem(self.llm, self.embedder,
@@ -2487,9 +2566,38 @@ class SynapseBrain:
                   f"{stats['total_episodes']} episodes, "
                   f"{stats['total_connections']} connections")
 
+        if SYNAPSE_AUTO_BACKFILL_EMBEDDINGS and self.embedder.available:
+            backfill = self.memory.backfill_vectors(max_items=5000)
+            if backfill.get("embedded", 0) > 0:
+                print(
+                    f"  Vector backfill: embedded {backfill['embedded']} "
+                    f"(failed {backfill['failed']})"
+                )
+
         self.qa = QAEngine(self.memory, self.llm)
         self.explorer = ScientificExplorer(self.memory, self.llm)
         print("  Brain ready.\n")
+
+    def _init_run_logging(self):
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_dir = os.path.join(self.memory_dir, "runs")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.run_log_path = os.path.join(self.run_dir, f"run_{self.run_id}.jsonl")
+
+    def _log_event(self, event_type: str, payload: Dict[str, Any]):
+        event = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,
+            "model": self.llm.model_name,
+            "llm_available": self.llm.is_available,
+            "run_id": self.run_id,
+            "payload": payload,
+        }
+        try:
+            with open(self.run_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=True) + "\n")
+        except Exception:
+            pass
 
     def _auto_save(self):
         """Save FAISS index. SQLite is already durable via write-through."""
@@ -2504,8 +2612,17 @@ class SynapseBrain:
                status_callback: Callable = None) -> Dict[str, Any]:
         llm_err = self._ensure_llm_available()
         if llm_err:
+            self._log_event("upload_error", {"doc_path": doc_path, "error": llm_err["error"]})
             return llm_err
         result = self.memory.extract_from_document(doc_path, status_callback)
+        self._log_event("upload", {
+            "doc_path": doc_path,
+            "memcells_created": result.get("memcells_created", 0),
+            "episodes_created": result.get("episodes_created", 0),
+            "profiles_updated": result.get("profiles_updated", 0),
+            "topics": result.get("topics", []),
+            "error": result.get("error")
+        })
         if 'error' not in result:
             if status_callback:
                 status_callback("Saving to long-term memory")
@@ -2516,8 +2633,18 @@ class SynapseBrain:
             status_callback: Callable = None) -> Dict[str, Any]:
         llm_err = self._ensure_llm_available()
         if llm_err:
+            self._log_event("ask_error", {"question": question, "error": llm_err["error"]})
             return llm_err
         result = self.qa.ask(question, status_callback)
+        self._log_event("ask", {
+            "question": question,
+            "mode": result.get("mode"),
+            "memories_used": result.get("memories_used", 0),
+            "elapsed": result.get("elapsed", 0.0),
+            "sources": result.get("sources", []),
+            "citation_coverage": (result.get("evidence_contract") or {}).get("citation_coverage", {}),
+            "error": result.get("error")
+        })
         self._auto_save()
         return result
 
@@ -2525,8 +2652,19 @@ class SynapseBrain:
                 status_callback: Callable = None) -> Dict[str, Any]:
         llm_err = self._ensure_llm_available()
         if llm_err:
+            self._log_event("explore_error", {"topic": topic, "depth": depth, "error": llm_err["error"]})
             return llm_err
         result = self.explorer.explore(topic, depth, status_callback)
+        first_iter = (result.get("iterations") or [{}])[0] if result.get("iterations") else {}
+        self._log_event("explore", {
+            "topic": topic,
+            "depth": depth,
+            "iterations": len(result.get("iterations", [])),
+            "duration": result.get("total_duration", 0.0),
+            "ranked_hypotheses_count": len(first_iter.get("ranked_hypotheses", [])),
+            "experiments_count": len(first_iter.get("experiments", [])),
+            "error": result.get("error")
+        })
         self._auto_save()
         return result
 
@@ -2546,6 +2684,7 @@ class SynapseBrain:
         }
         if self.memory.faiss_vectors:
             stats['faiss_vectors'] = self.memory.faiss_vectors.size
+        stats['in_memory_vectors'] = len(self.memory.vectors.embeddings)
         return stats
 
     def close(self):
