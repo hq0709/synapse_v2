@@ -75,7 +75,8 @@ GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.95"))
 GEMINI_TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
-GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "768"))
 SYNAPSE_AUTO_BACKFILL_EMBEDDINGS = os.getenv(
     "SYNAPSE_AUTO_BACKFILL_EMBEDDINGS", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -258,13 +259,27 @@ class EmbeddingProvider:
         self.dim = 0
         self.model_name: Optional[str] = None
         self.error_message: Optional[str] = None
+        self.document_config = None
+        self.query_config = None
         if api_key and genai and genai_types:
             try:
                 self.client = genai.Client(api_key=api_key)
                 self.model_name = GEMINI_EMBEDDING_MODEL
+                if GEMINI_EMBEDDING_DIM <= 0:
+                    raise ValueError("GEMINI_EMBEDDING_DIM must be a positive integer.")
+                if self._uses_mrl_embedding():
+                    self.document_config = genai_types.EmbedContentConfig(
+                        task_type="RETRIEVAL_DOCUMENT",
+                        output_dimensionality=GEMINI_EMBEDDING_DIM,
+                    )
+                    self.query_config = genai_types.EmbedContentConfig(
+                        task_type="RETRIEVAL_QUERY",
+                        output_dimensionality=GEMINI_EMBEDDING_DIM,
+                    )
                 probe = self.client.models.embed_content(
                     model=self.model_name,
-                    contents="test"
+                    contents="test",
+                    config=self.query_config,
                 )
                 values = self._extract_embedding_values(probe)
                 if not values:
@@ -281,6 +296,11 @@ class EmbeddingProvider:
     def _mark_unavailable(self, message: str):
         self.available = False
         self.error_message = message
+
+    def _uses_mrl_embedding(self) -> bool:
+        if not self.model_name:
+            return False
+        return "gemini-embedding-001" in self.model_name
 
     def _extract_embedding_values(self, response: Any) -> Optional[List[float]]:
         if response is None:
@@ -305,7 +325,8 @@ class EmbeddingProvider:
         try:
             result = self.client.models.embed_content(
                 model=self.model_name,
-                contents=text[:2000]
+                contents=text[:2000],
+                config=self.document_config,
             )
             return self._extract_embedding_values(result)
         except Exception as e:
@@ -318,7 +339,8 @@ class EmbeddingProvider:
         try:
             result = self.client.models.embed_content(
                 model=self.model_name,
-                contents=text[:2000]
+                contents=text[:2000],
+                config=self.query_config,
             )
             return self._extract_embedding_values(result)
         except Exception as e:
@@ -845,7 +867,8 @@ class MemorySystem:
             os.makedirs(storage_dir, exist_ok=True)
             db_path = os.path.join(storage_dir, 'synapse.db')
             self.db = SQLiteStorage(db_path)
-            self.faiss_vectors = FAISSVectorStore(dim=768, m=32)
+            vector_dim = embedder.dim if embedder.dim > 0 else GEMINI_EMBEDDING_DIM
+            self.faiss_vectors = FAISSVectorStore(dim=vector_dim, m=32)
             # Load FAISS index if exists
             idx_path = os.path.join(storage_dir, 'vectors.faiss')
             ids_path = os.path.join(storage_dir, 'vector_ids.json')

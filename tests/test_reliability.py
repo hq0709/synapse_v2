@@ -34,7 +34,7 @@ class ServiceGateTests(unittest.TestCase):
         brain.llm = SimpleNamespace(is_available=llm_available, model_name="gemini-test", last_error=None)
         brain.embedder = SimpleNamespace(
             available=emb_available,
-            model_name="text-embedding-004",
+            model_name="gemini-embedding-001",
             error_message=emb_error,
         )
         brain.memory = SimpleNamespace(

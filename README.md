@@ -25,7 +25,8 @@ Environment variables:
 - `GEMINI_TOP_P`: nucleus sampling parameter.
 - `GEMINI_TOP_K`: top-k sampling parameter.
 - `GEMINI_MAX_OUTPUT_TOKENS`: output budget per call.
-- `GEMINI_EMBEDDING_MODEL`: fixed embedding model for all runs.
+- `GEMINI_EMBEDDING_MODEL`: fixed embedding model for all runs (default `gemini-embedding-001`).
+- `GEMINI_EMBEDDING_DIM`: embedding output dimensionality (default `768`).
 - `SYNAPSE_AUTO_BACKFILL_EMBEDDINGS`: auto-embed legacy memories missing vectors at startup.
 - `SYNAPSE_MEMORY_DIR`: persistent memory directory (default `.synapse_memory`).
 
