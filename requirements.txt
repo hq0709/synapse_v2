@@ -2,5 +2,5 @@
 google-genai>=1.0.0
 numpy>=1.26.0
 
-# Optional: fast vector retrieval backend (falls back gracefully if unavailable)
-faiss-cpu>=1.8.0; platform_system != "Darwin" or platform_machine != "arm64"
+# Fast vector retrieval backend (falls back to in-memory if unavailable at runtime)
+faiss-cpu>=1.13.0

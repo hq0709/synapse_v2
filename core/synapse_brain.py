@@ -2757,6 +2757,9 @@ class SynapseBrain:
             return {'found': False, 'message': err}
 
     def get_stats(self) -> Dict[str, Any]:
+        has_faiss_backend = bool(
+            self.memory.faiss_vectors and self.memory.faiss_vectors.index is not None
+        )
         stats = {
             'memory': self.memory.stats,
             'llm_available': self.llm.is_available,
@@ -2765,9 +2768,14 @@ class SynapseBrain:
             'profiles': list(self.memory.profiles.keys()),
             'episodes': len(self.memory.episodes),
             'conversation_length': len(self.qa.conversation_history),
-            'storage': 'sqlite+faiss' if self.memory.db else 'memory-only',
+            'vector_backend': 'faiss' if has_faiss_backend else 'in-memory',
+            'storage': (
+                'sqlite+faiss' if self.memory.db and has_faiss_backend
+                else 'sqlite+in-memory' if self.memory.db
+                else 'memory-only'
+            ),
         }
-        if self.memory.faiss_vectors:
+        if has_faiss_backend and self.memory.faiss_vectors:
             stats['faiss_vectors'] = self.memory.faiss_vectors.size
         stats['in_memory_vectors'] = len(self.memory.vectors.embeddings)
         return stats

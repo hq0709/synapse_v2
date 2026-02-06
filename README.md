@@ -91,4 +91,4 @@ Details: `evaluation/README.md`
 
 - QA evidence retrieval is now purity-filtered to `ATOMIC_FACT` and `EPISODE` only.
 - Long documents are processed with chunked extraction and hierarchical summarization.
-- If `faiss` is unavailable, retrieval falls back to in-memory cosine search.
+- FAISS is used by default for vector retrieval speed; if unavailable at runtime, retrieval falls back to in-memory cosine search.

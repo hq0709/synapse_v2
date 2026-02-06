@@ -362,12 +362,15 @@ class Synapse:
         print(f"\n{C.B}Brain Status:{C.R}")
         print(f"  LLM: {'Connected' if stats['llm_available'] else 'Offline'}")
         print(f"  Embeddings: {'Connected' if stats.get('embeddings_available') else 'Offline'}")
+        print(f"  Vector backend: {stats.get('vector_backend', 'unknown')}")
         print(f"  LLM calls: {stats['llm_calls']}")
         print(f"  Memories: {mem['total_memcells']}")
         print(f"  Episodes: {mem['total_episodes']}")
         print(f"  Connections: {mem['total_connections']}")
         print(f"  Contradictions: {mem.get('total_contradictions', 0)}")
         print(f"  Retrievals: {mem['total_retrievals']}")
+        print(f"  FAISS vectors: {stats.get('faiss_vectors', 0)}")
+        print(f"  In-memory vectors: {stats.get('in_memory_vectors', 0)}")
         print(f"  Conversations: {stats['conversation_length']}")
 
         if stats['profiles']:
