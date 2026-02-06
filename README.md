@@ -60,10 +60,32 @@ and runtime info for reproducibility and paper traceability.
 ```bash
 # no-network unit checks
 python -m unittest tests/test_reliability.py
+python -m unittest tests/test_evaluation_metrics.py
 
 # online end-to-end smoke check (requires GEMINI_API_KEY)
 python scripts/reliability_smoke.py
 ```
+
+## Evaluation and ablation
+
+```bash
+python scripts/run_evaluation.py \
+  --dataset evaluation/datasets/sample_eval.jsonl \
+  --profiles full,no_memory,no_agentic,no_purity,no_hier_summary \
+  --outdir evaluation/results
+```
+
+Fast iteration on existing memory:
+
+```bash
+python scripts/run_evaluation.py \
+  --dataset evaluation/datasets/sample_eval.jsonl \
+  --profiles full,no_agentic \
+  --skip-setup-upload \
+  --no-isolate-memory
+```
+
+Details: `evaluation/README.md`
 
 ## Notes
 

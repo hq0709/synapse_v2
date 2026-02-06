@@ -12,6 +12,7 @@ __pycache__/
 
 # Runtime data
 .synapse_memory/
+evaluation/results/
 
 # OS files
 .DS_Store
