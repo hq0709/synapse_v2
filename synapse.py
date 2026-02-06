@@ -108,6 +108,7 @@ class Synapse:
         print(f"  {C.L}/memory trace <query>{C.R}  Trace memory")
         print(f"  {C.L}/explore <topic>{C.R}       Deep exploration")
         print(f"  {C.L}/status{C.R}                Show stats")
+        print(f"  {C.L}/selfcheck{C.R}             Preflight diagnostics")
         print(f"  {C.L}/help{C.R}                  Commands")
         print(f"  {C.L}/exit{C.R}                  Quit")
         print(f"\n{C.D}Or type a question directly{C.R}\n")
@@ -123,6 +124,8 @@ class Synapse:
             self._explore(args)
         elif cmd in ('s', 'status'):
             self._status()
+        elif cmd in ('selfcheck', 'check'):
+            self._selfcheck()
         elif cmd in ('h', 'help', '?'):
             self._show_help()
         elif cmd in ('c', 'clear'):
@@ -272,7 +275,7 @@ class Synapse:
         if len(parts) > 1:
             try:
                 depth = max(1, min(5, int(parts[1].strip())))
-            except:
+            except ValueError:
                 pass
 
         print(f"\n{C.B}{C.BOLD}Deep Exploration: {topic}{C.R}")
@@ -370,6 +373,22 @@ class Synapse:
         if stats['profiles']:
             print(f"  Topics: {', '.join(stats['profiles'][:5])}")
 
+        print()
+
+    def _selfcheck(self):
+        checks = self.brain.preflight_check()
+        print(f"\n{C.B}Preflight Check:{C.R}")
+        print(f"  OK: {'Yes' if checks.get('ok') else 'No'}")
+        print(f"  LLM: {'Connected' if checks.get('llm_available') else 'Offline'} ({checks.get('llm_model')})")
+        print(f"  Embeddings: {'Connected' if checks.get('embedding_available') else 'Offline'} ({checks.get('embedding_model')})")
+        print(f"  Vector backend: {checks.get('vector_backend')}")
+        print(f"  FAISS vectors: {checks.get('faiss_vectors', 0)}")
+        print(f"  In-memory vectors: {checks.get('in_memory_vectors', 0)}")
+        print(f"  Run log dir writable: {'Yes' if checks.get('run_log_writable') else 'No'}")
+        if checks.get('errors'):
+            print(f"{C.D}Errors:{C.R}")
+            for err in checks['errors']:
+                print(f"  {C.D}- {err}{C.R}")
         print()
 
     def _exit(self):

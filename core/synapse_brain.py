@@ -89,6 +89,19 @@ EMBEDDINGS_REQUIRED_ERROR = (
 )
 
 
+def _detail_suffix(message: Optional[str]) -> str:
+    if not message:
+        return ""
+    return f" Details: {message}"
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _extract_first_json(
     text: str,
     expected: Optional[Union[type, Tuple[type, ...]]] = None
@@ -242,6 +255,7 @@ class EmbeddingProvider:
     def __init__(self, api_key: str = None):
         self.available = False
         self.client = None
+        self.dim = 0
         self.model_name: Optional[str] = None
         self.error_message: Optional[str] = None
         if api_key and genai and genai_types:
@@ -259,10 +273,14 @@ class EmbeddingProvider:
                 self.available = True
                 print(f"  Embeddings: Gemini {self.dim}D connected ({self.model_name})")
             except Exception as e:
-                self.error_message = str(e)
+                self._mark_unavailable(str(e))
                 print(f"  Embeddings: Failed ({self.error_message})")
         else:
             print("  Embeddings: Offline")
+
+    def _mark_unavailable(self, message: str):
+        self.available = False
+        self.error_message = message
 
     def _extract_embedding_values(self, response: Any) -> Optional[List[float]]:
         if response is None:
@@ -290,7 +308,8 @@ class EmbeddingProvider:
                 contents=text[:2000]
             )
             return self._extract_embedding_values(result)
-        except Exception:
+        except Exception as e:
+            self._mark_unavailable(str(e))
             return None
 
     def embed_query(self, text: str) -> Optional[List[float]]:
@@ -302,7 +321,8 @@ class EmbeddingProvider:
                 contents=text[:2000]
             )
             return self._extract_embedding_values(result)
-        except Exception:
+        except Exception as e:
+            self._mark_unavailable(str(e))
             return None
 
 
@@ -575,6 +595,7 @@ class FAISSVectorStore:
 
     def __init__(self, dim: int = 768, m: int = 32):
         self.dim = dim
+        self.last_error: Optional[str] = None
         self.id_to_idx: Dict[str, int] = {}   # doc_id → FAISS int index
         self.idx_to_id: Dict[int, str] = {}   # FAISS int index → doc_id
         self.next_idx = 0
@@ -698,8 +719,10 @@ class FAISSVectorStore:
             self.id_to_idx = ids_data['id_to_idx']
             self.idx_to_id = {int(k): v for k, v in ids_data['idx_to_id'].items()}
             self.next_idx = ids_data['next_idx']
+            self.last_error = None
             return True
-        except Exception:
+        except Exception as e:
+            self.last_error = str(e)
             return False
 
 
@@ -747,6 +770,7 @@ class LLMProvider:
         self.client = None
         self.call_count = 0
         self.model_name = GEMINI_MODEL
+        self.last_error: Optional[str] = None
         self.generation_config = None
         if api_key and genai and genai_types:
             try:
@@ -760,6 +784,7 @@ class LLMProvider:
                 )
                 print(f"  LLM: Gemini connected ({self.model_name}, temp={GEMINI_TEMPERATURE})")
             except Exception as e:
+                self.last_error = str(e)
                 print(f"  LLM: Failed ({e})")
         else:
             print("  LLM: Offline")
@@ -779,6 +804,7 @@ class LLMProvider:
                 if text:
                     return text.strip()
             except Exception as e:
+                self.last_error = str(e)
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                     continue
@@ -824,7 +850,9 @@ class MemorySystem:
             idx_path = os.path.join(storage_dir, 'vectors.faiss')
             ids_path = os.path.join(storage_dir, 'vector_ids.json')
             if os.path.exists(idx_path):
-                self.faiss_vectors.load(idx_path, ids_path)
+                loaded = self.faiss_vectors.load(idx_path, ids_path)
+                if not loaded and self.faiss_vectors.last_error:
+                    print(f"  Warning: failed to load FAISS index ({self.faiss_vectors.last_error})")
             # Populate in-memory caches from SQLite
             self._load_from_sqlite()
 
@@ -1032,69 +1060,72 @@ Document-level overview:"""
             return {'error': str(e)}
 
         result = {'memcells': [], 'episodes': [], 'profile_updates': []}
-        chunks = self._chunk_text(content)
+        try:
+            chunks = self._chunk_text(content)
 
-        if status_callback:
-            status_callback("Summarizing document chunks")
-        doc_summary = self._build_hierarchical_document_summary(chunks)
-
-        # Step 1: Extract atomic facts
-        if status_callback:
-            status_callback("Extracting atomic facts")
-        facts = self._extract_atomic_facts(content, doc_path, chunks=chunks)
-        for fact_text, evidence_text in facts:
-            mem = self._store_memcell(
-                content=fact_text,
-                memory_type=MemoryType.ATOMIC_FACT,
-                evidence=[Evidence(content=evidence_text, source=doc_path,
-                                   type="direct", confidence=0.9)],
-                source_doc=doc_path
-            )
-            result['memcells'].append(mem.id)
-
-        # Step 2: Connect related facts (semantic + keyword)
-        if status_callback:
-            status_callback("Building connections")
-        self._auto_connect(result['memcells'])
-
-        # Step 3: Construct episode
-        if status_callback:
-            status_callback("Constructing episode narrative")
-        episode = self._construct_episode(
-            content, doc_path, result['memcells'],
-            chunks=chunks, doc_summary=doc_summary
-        )
-        if episode:
-            result['episodes'].append(episode.id)
-
-        # Step 4: Topic profiles
-        if status_callback:
-            status_callback("Building topic profiles")
-        topics = self._extract_topics(content, chunks=chunks, doc_summary=doc_summary)
-        for topic in topics:
-            self._update_profile(topic, result['memcells'])
-            result['profile_updates'].append(topic)
-
-        # Step 5: Foresight
-        if status_callback:
-            status_callback("Generating foresight")
-        self._extract_foresight(
-            content, doc_path, result['memcells'],
-            chunks=chunks, doc_summary=doc_summary
-        )
-
-        # Step 6: Consolidate with existing memories (cross-document)
-        if self.stats['total_memcells'] > len(result['memcells']):
             if status_callback:
-                status_callback("Consolidating memories")
-            self._consolidate(result['memcells'], status_callback)
+                status_callback("Summarizing document chunks")
+            doc_summary = self._build_hierarchical_document_summary(chunks)
 
-        return {
-            'memcells_created': len(result['memcells']),
-            'episodes_created': len(result['episodes']),
-            'profiles_updated': len(result['profile_updates']),
-            'topics': topics
-        }
+            # Step 1: Extract atomic facts
+            if status_callback:
+                status_callback("Extracting atomic facts")
+            facts = self._extract_atomic_facts(content, doc_path, chunks=chunks)
+            for fact_text, evidence_text in facts:
+                mem = self._store_memcell(
+                    content=fact_text,
+                    memory_type=MemoryType.ATOMIC_FACT,
+                    evidence=[Evidence(content=evidence_text, source=doc_path,
+                                       type="direct", confidence=0.9)],
+                    source_doc=doc_path
+                )
+                result['memcells'].append(mem.id)
+
+            # Step 2: Connect related facts (semantic + keyword)
+            if status_callback:
+                status_callback("Building connections")
+            self._auto_connect(result['memcells'])
+
+            # Step 3: Construct episode
+            if status_callback:
+                status_callback("Constructing episode narrative")
+            episode = self._construct_episode(
+                content, doc_path, result['memcells'],
+                chunks=chunks, doc_summary=doc_summary
+            )
+            if episode:
+                result['episodes'].append(episode.id)
+
+            # Step 4: Topic profiles
+            if status_callback:
+                status_callback("Building topic profiles")
+            topics = self._extract_topics(content, chunks=chunks, doc_summary=doc_summary)
+            for topic in topics:
+                self._update_profile(topic, result['memcells'])
+                result['profile_updates'].append(topic)
+
+            # Step 5: Foresight
+            if status_callback:
+                status_callback("Generating foresight")
+            self._extract_foresight(
+                content, doc_path, result['memcells'],
+                chunks=chunks, doc_summary=doc_summary
+            )
+
+            # Step 6: Consolidate with existing memories (cross-document)
+            if self.stats['total_memcells'] > len(result['memcells']):
+                if status_callback:
+                    status_callback("Consolidating memories")
+                self._consolidate(result['memcells'], status_callback)
+
+            return {
+                'memcells_created': len(result['memcells']),
+                'episodes_created': len(result['episodes']),
+                'profiles_updated': len(result['profile_updates']),
+                'topics': topics
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
     def _extract_atomic_facts(self, content: str, source: str,
                               chunks: Optional[List[str]] = None) -> List[Tuple[str, str]]:
@@ -1378,8 +1409,11 @@ Return ONLY JSON."""
         mem_id = self._gen_id(content + str(datetime.now()))
         keywords = self._tokenize(content)
 
-        # Compute embedding
-        embedding = self.embedder.embed_document(content) if self.embedder.available else None
+        if not self.embedder.available:
+            raise RuntimeError(EMBEDDINGS_REQUIRED_ERROR + _detail_suffix(self.embedder.error_message))
+        embedding = self.embedder.embed_document(content)
+        if embedding is None:
+            raise RuntimeError("Embedding generation failed while storing memory." + _detail_suffix(self.embedder.error_message))
 
         memcell = MemCell(
             id=mem_id, memory_type=memory_type, content=content,
@@ -1509,10 +1543,10 @@ Return ONLY JSON."""
                              top_k: int) -> List[Tuple[str, float]]:
         """Semantic retrieval via Gemini embeddings + FAISS HNSW."""
         if not self.embedder.available:
-            return []
+            raise RuntimeError(EMBEDDINGS_REQUIRED_ERROR + _detail_suffix(self.embedder.error_message))
         query_emb = self.embedder.embed_query(query)
         if query_emb is None:
-            return []
+            raise RuntimeError("Embedding query failed." + _detail_suffix(self.embedder.error_message))
         if self.faiss_vectors and self.faiss_vectors.size > 0:
             return self.faiss_vectors.search(query_emb, top_k)
         if self.vectors.embeddings:
@@ -2460,10 +2494,10 @@ Return ONLY JSON array."""
                     cleaned.append({
                         **item,
                         'status': 'ranked',
-                        'testability_score': float(item.get('testability_score', 0.0)),
-                        'novelty_score': float(item.get('novelty_score', 0.0)),
-                        'falsifiability_score': float(item.get('falsifiability_score', 0.0)),
-                        'priority_score': float(item.get('priority_score', 0.0))
+                        'testability_score': _safe_float(item.get('testability_score', 0.0)),
+                        'novelty_score': _safe_float(item.get('novelty_score', 0.0)),
+                        'falsifiability_score': _safe_float(item.get('falsifiability_score', 0.0)),
+                        'priority_score': _safe_float(item.get('priority_score', 0.0))
                     })
                 cleaned.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
                 return cleaned[:4]
@@ -2505,7 +2539,7 @@ Return ONLY JSON array."""
                             'measurable_outcome': item.get('measurable_outcome', ''),
                             'failure_signal': item.get('failure_signal', ''),
                             'resources': item.get('resources', ''),
-                            'priority_score': float(item.get('priority_score', 0.0)),
+                            'priority_score': _safe_float(item.get('priority_score', 0.0)),
                             'status': 'experiment_designed'
                         })
                 if experiments:
@@ -2609,8 +2643,7 @@ class SynapseBrain:
         if not self.llm.is_available:
             return {'error': LLM_REQUIRED_ERROR}
         if not self.embedder.available:
-            detail = f" Details: {self.embedder.error_message}" if self.embedder.error_message else ""
-            return {'error': EMBEDDINGS_REQUIRED_ERROR + detail}
+            return {'error': EMBEDDINGS_REQUIRED_ERROR + _detail_suffix(self.embedder.error_message)}
         return None
 
     def upload(self, doc_path: str,
@@ -2619,7 +2652,12 @@ class SynapseBrain:
         if service_err:
             self._log_event("upload_error", {"doc_path": doc_path, "error": service_err["error"]})
             return service_err
-        result = self.memory.extract_from_document(doc_path, status_callback)
+        try:
+            result = self.memory.extract_from_document(doc_path, status_callback)
+        except Exception as e:
+            err = str(e)
+            self._log_event("upload_error", {"doc_path": doc_path, "error": err})
+            return {'error': err}
         self._log_event("upload", {
             "doc_path": doc_path,
             "memcells_created": result.get("memcells_created", 0),
@@ -2640,7 +2678,12 @@ class SynapseBrain:
         if service_err:
             self._log_event("ask_error", {"question": question, "error": service_err["error"]})
             return service_err
-        result = self.qa.ask(question, status_callback)
+        try:
+            result = self.qa.ask(question, status_callback)
+        except Exception as e:
+            err = str(e)
+            self._log_event("ask_error", {"question": question, "error": err})
+            return {'error': err}
         self._log_event("ask", {
             "question": question,
             "mode": result.get("mode"),
@@ -2659,7 +2702,12 @@ class SynapseBrain:
         if service_err:
             self._log_event("explore_error", {"topic": topic, "depth": depth, "error": service_err["error"]})
             return service_err
-        result = self.explorer.explore(topic, depth, status_callback)
+        try:
+            result = self.explorer.explore(topic, depth, status_callback)
+        except Exception as e:
+            err = str(e)
+            self._log_event("explore_error", {"topic": topic, "depth": depth, "error": err})
+            return {'error': err}
         first_iter = (result.get("iterations") or [{}])[0] if result.get("iterations") else {}
         self._log_event("explore", {
             "topic": topic,
@@ -2678,7 +2726,12 @@ class SynapseBrain:
         if service_err:
             self._log_event("trace_error", {"query": query, "error": service_err["error"]})
             return {'found': False, 'message': service_err["error"]}
-        return self.memory.trace(query)
+        try:
+            return self.memory.trace(query)
+        except Exception as e:
+            err = str(e)
+            self._log_event("trace_error", {"query": query, "error": err})
+            return {'found': False, 'message': err}
 
     def get_stats(self) -> Dict[str, Any]:
         stats = {
@@ -2695,6 +2748,36 @@ class SynapseBrain:
             stats['faiss_vectors'] = self.memory.faiss_vectors.size
         stats['in_memory_vectors'] = len(self.memory.vectors.embeddings)
         return stats
+
+    def preflight_check(self) -> Dict[str, Any]:
+        run_log_parent = os.path.dirname(self.run_log_path)
+        checks: Dict[str, Any] = {
+            'llm_available': self.llm.is_available,
+            'llm_model': self.llm.model_name,
+            'llm_error': self.llm.last_error,
+            'embedding_available': self.embedder.available,
+            'embedding_model': self.embedder.model_name,
+            'embedding_error': self.embedder.error_message,
+            'storage_dir_exists': os.path.isdir(self.memory_dir),
+            'run_log_parent_exists': os.path.isdir(run_log_parent),
+            'run_log_writable': os.access(run_log_parent, os.W_OK) if os.path.isdir(run_log_parent) else False,
+            'vector_backend': 'faiss' if self.memory.faiss_vectors and self.memory.faiss_vectors.index is not None else 'in-memory',
+            'faiss_vectors': self.memory.faiss_vectors.size if self.memory.faiss_vectors else 0,
+            'in_memory_vectors': len(self.memory.vectors.embeddings),
+            'errors': []
+        }
+        if not checks['llm_available']:
+            checks['errors'].append(LLM_REQUIRED_ERROR)
+        if not checks['embedding_available']:
+            checks['errors'].append(EMBEDDINGS_REQUIRED_ERROR + _detail_suffix(self.embedder.error_message))
+        if not checks['storage_dir_exists']:
+            checks['errors'].append(f"Storage directory missing: {self.memory_dir}")
+        if not checks['run_log_parent_exists']:
+            checks['errors'].append(f"Run log directory missing: {run_log_parent}")
+        elif not checks['run_log_writable']:
+            checks['errors'].append(f"Run log directory not writable: {run_log_parent}")
+        checks['ok'] = len(checks['errors']) == 0
+        return checks
 
     def close(self):
         """Flush FAISS index and close SQLite connection."""

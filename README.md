@@ -51,6 +51,17 @@ and runtime info for reproducibility and paper traceability.
 /memory trace <query>   Trace relevant memory graph
 /explore <topic>        Multi-step scientific exploration
 /status                 Runtime and memory stats
+/selfcheck              Dependency and storage preflight checks
+```
+
+## Reliability checks
+
+```bash
+# no-network unit checks
+python -m unittest tests/test_reliability.py
+
+# online end-to-end smoke check (requires GEMINI_API_KEY)
+python scripts/reliability_smoke.py
 ```
 
 ## Notes
