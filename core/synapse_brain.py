@@ -70,7 +70,7 @@ _load_env_file(PROJECT_ROOT / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MEMORY_DIR = os.getenv("SYNAPSE_MEMORY_DIR", ".synapse_memory")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview")
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.95"))
 GEMINI_TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))

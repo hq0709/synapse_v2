@@ -20,7 +20,7 @@ cp .env.example .env
 
 Environment variables:
 - `GEMINI_API_KEY`: enables Gemini generation and embeddings.
-- `GEMINI_MODEL`: model name (default `gemini-2.0-flash`).
+- `GEMINI_MODEL`: model name (default `gemini-3-pro-preview`).
 - `GEMINI_TEMPERATURE`: generation temperature (default `0.0` for reproducibility).
 - `GEMINI_TOP_P`: nucleus sampling parameter.
 - `GEMINI_TOP_K`: top-k sampling parameter.
