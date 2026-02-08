@@ -23,6 +23,7 @@ import json
 import hashlib
 import re
 import math
+import heapq
 import os
 import sqlite3
 import tempfile
@@ -232,6 +233,21 @@ class BM25:
         total = sum(self.doc_lens.values())
         self.avg_dl = total / self.corpus_size if self.corpus_size > 0 else 0
 
+    def remove_document(self, doc_id: str):
+        keywords = self.doc_keywords.pop(doc_id, None)
+        dl = self.doc_lens.pop(doc_id, None)
+        if keywords is None or dl is None:
+            return
+        for kw in set(keywords):
+            current = self.doc_freqs.get(kw, 0) - 1
+            if current <= 0:
+                self.doc_freqs.pop(kw, None)
+            else:
+                self.doc_freqs[kw] = current
+        self.corpus_size = max(0, self.corpus_size - 1)
+        total = sum(self.doc_lens.values())
+        self.avg_dl = total / self.corpus_size if self.corpus_size > 0 else 0
+
     def score(self, query_keywords: List[str], doc_id: str) -> float:
         if doc_id not in self.doc_keywords:
             return 0.0
@@ -271,6 +287,9 @@ class EmbeddingProvider:
         self.error_message: Optional[str] = None
         self.document_config = None
         self.query_config = None
+        self.probe_fatal = False
+        self.next_probe_ts = 0.0
+        self.probe_backoff_sec = 5.0
         if api_key and genai and genai_types:
             try:
                 self.client = genai.Client(api_key=api_key)
@@ -286,17 +305,10 @@ class EmbeddingProvider:
                         task_type="RETRIEVAL_QUERY",
                         output_dimensionality=GEMINI_EMBEDDING_DIM,
                     )
-                probe = self.client.models.embed_content(
-                    model=self.model_name,
-                    contents="test",
-                    config=self.query_config,
-                )
-                values = self._extract_embedding_values(probe)
-                if not values:
-                    raise ValueError("Embedding probe returned empty vector.")
-                self.dim = len(values)
-                self.available = True
-                print(f"  Embeddings: Gemini {self.dim}D connected ({self.model_name})")
+                if self._probe_availability():
+                    print(f"  Embeddings: Gemini {self.dim}D connected ({self.model_name})")
+                else:
+                    print(f"  Embeddings: Failed ({self.error_message})")
             except Exception as e:
                 self._mark_unavailable(str(e))
                 print(f"  Embeddings: Failed ({self.error_message})")
@@ -306,11 +318,81 @@ class EmbeddingProvider:
     def _mark_unavailable(self, message: str):
         self.available = False
         self.error_message = message
+        self.probe_fatal = True
+        self.next_probe_ts = float("inf")
 
     def _uses_mrl_embedding(self) -> bool:
         if not self.model_name:
             return False
         return "gemini-embedding-001" in self.model_name
+
+    @staticmethod
+    def _is_fatal_error(message: str) -> bool:
+        text = (message or "").lower()
+        fatal_markers = (
+            "not found",
+            "unsupported",
+            "permission denied",
+            "forbidden",
+            "unauthorized",
+            "api key",
+            "authentication",
+            "invalid argument",
+            "invalid model",
+            "404",
+            "401",
+            "403",
+        )
+        return any(marker in text for marker in fatal_markers)
+
+    def _probe_availability(self) -> bool:
+        if not self.client or not self.model_name:
+            return False
+        try:
+            probe = self.client.models.embed_content(
+                model=self.model_name,
+                contents="test",
+                config=self.query_config,
+            )
+            values = self._extract_embedding_values(probe)
+            if not values:
+                raise ValueError("Embedding probe returned empty vector.")
+            self.dim = len(values)
+            self.available = True
+            self.error_message = None
+            self.probe_fatal = False
+            self.next_probe_ts = 0.0
+            return True
+        except Exception as e:
+            msg = str(e)
+            self.error_message = msg
+            self.available = False
+            if self._is_fatal_error(msg):
+                self.probe_fatal = True
+                self.next_probe_ts = float("inf")
+            else:
+                self.probe_fatal = False
+                self.next_probe_ts = time.time() + self.probe_backoff_sec
+            return False
+
+    def _register_runtime_error(self, message: str):
+        self.error_message = message
+        if self._is_fatal_error(message):
+            self._mark_unavailable(message)
+        else:
+            # Keep service enabled for transient failures; retry with backoff.
+            self.available = True
+            self.probe_fatal = False
+            self.next_probe_ts = time.time() + min(10.0, self.probe_backoff_sec)
+
+    def _ensure_available(self) -> bool:
+        if self.available and self.client and self.model_name:
+            return True
+        if not self.client or not self.model_name or self.probe_fatal:
+            return False
+        if time.time() < self.next_probe_ts:
+            return False
+        return self._probe_availability()
 
     def _extract_embedding_values(self, response: Any) -> Optional[List[float]]:
         if response is None:
@@ -330,7 +412,7 @@ class EmbeddingProvider:
         return None
 
     def embed_document(self, text: str) -> Optional[List[float]]:
-        if not self.available or not self.client or not self.model_name:
+        if not self._ensure_available():
             return None
         try:
             result = self.client.models.embed_content(
@@ -340,11 +422,11 @@ class EmbeddingProvider:
             )
             return self._extract_embedding_values(result)
         except Exception as e:
-            self._mark_unavailable(str(e))
+            self._register_runtime_error(str(e))
             return None
 
     def embed_query(self, text: str) -> Optional[List[float]]:
-        if not self.available or not self.client or not self.model_name:
+        if not self._ensure_available():
             return None
         try:
             result = self.client.models.embed_content(
@@ -354,7 +436,7 @@ class EmbeddingProvider:
             )
             return self._extract_embedding_values(result)
         except Exception as e:
-            self._mark_unavailable(str(e))
+            self._register_runtime_error(str(e))
             return None
 
 
@@ -456,29 +538,28 @@ class SQLiteStorage:
     # ---- MemCells ----
 
     def insert_memcell(self, mc: 'MemCell'):
-        self.conn.execute(
-            """INSERT OR REPLACE INTO memcells
-               (id, memory_type, content, source_doc, source_section, timestamp,
-                keywords, connections, importance, access_count, last_accessed,
-                has_embedding, metadata)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (mc.id, mc.memory_type.value, mc.content, mc.source_doc,
-             mc.source_section, mc.timestamp.isoformat(),
-             json.dumps(mc.keywords), json.dumps(mc.connections),
-             mc.importance, mc.access_count,
-             mc.last_accessed.isoformat() if mc.last_accessed else None,
-             1 if mc.embedding else 0, json.dumps(mc.metadata))
-        )
-        # Insert evidence rows
-        self.conn.execute("DELETE FROM evidence WHERE memcell_id=?", (mc.id,))
-        for ev in mc.evidence:
-            self.conn.execute(
-                """INSERT INTO evidence (memcell_id, content, source, type, confidence, timestamp)
-                   VALUES (?,?,?,?,?,?)""",
-                (mc.id, ev.content, ev.source, ev.type, ev.confidence,
-                 ev.timestamp.isoformat())
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO memcells
+                   (id, memory_type, content, source_doc, source_section, timestamp,
+                    keywords, connections, importance, access_count, last_accessed,
+                    has_embedding, metadata)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (mc.id, mc.memory_type.value, mc.content, mc.source_doc,
+                 mc.source_section, mc.timestamp.isoformat(),
+                 json.dumps(mc.keywords), json.dumps(mc.connections),
+                 mc.importance, mc.access_count,
+                 mc.last_accessed.isoformat() if mc.last_accessed else None,
+                 1 if mc.embedding else 0, json.dumps(mc.metadata))
             )
-        self.conn.commit()
+            conn.execute("DELETE FROM evidence WHERE memcell_id=?", (mc.id,))
+            for ev in mc.evidence:
+                conn.execute(
+                    """INSERT INTO evidence (memcell_id, content, source, type, confidence, timestamp)
+                       VALUES (?,?,?,?,?,?)""",
+                    (mc.id, ev.content, ev.source, ev.type, ev.confidence,
+                     ev.timestamp.isoformat())
+                )
 
     def get_memcell(self, mid: str) -> Optional[dict]:
         row = self.conn.execute("SELECT * FROM memcells WHERE id=?", (mid,)).fetchone()
@@ -495,8 +576,29 @@ class SQLiteStorage:
         return data
 
     def get_all_memcells(self) -> List[dict]:
-        rows = self.conn.execute("SELECT id FROM memcells").fetchall()
-        return [self.get_memcell(r['id']) for r in rows]
+        mem_rows = self.conn.execute("SELECT * FROM memcells").fetchall()
+        if not mem_rows:
+            return []
+        evidence_rows = self.conn.execute("SELECT * FROM evidence").fetchall()
+        evidence_by_mem: Dict[str, List[dict]] = defaultdict(list)
+        for ev in evidence_rows:
+            data = dict(ev)
+            evidence_by_mem[data['memcell_id']].append(data)
+
+        result = []
+        for row in mem_rows:
+            data = dict(row)
+            data['keywords'] = json.loads(data['keywords'])
+            data['connections'] = json.loads(data['connections'])
+            data['metadata'] = json.loads(data['metadata'])
+            data['evidence'] = evidence_by_mem.get(data['id'], [])
+            result.append(data)
+        return result
+
+    def delete_memcell(self, mid: str):
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM evidence WHERE memcell_id=?", (mid,))
+            conn.execute("DELETE FROM memcells WHERE id=?", (mid,))
 
     def get_memcells_by_type(self, memory_type: str) -> List[str]:
         rows = self.conn.execute(
@@ -1456,25 +1558,46 @@ Return ONLY JSON."""
             metadata=metadata or {}
         )
 
-        # In-memory
-        self.memcells[mem_id] = memcell
-        self.type_index[memory_type].add(mem_id)
-        if source_doc:
-            self.source_index[source_doc].add(mem_id)
-        self.bm25.add_document(mem_id, keywords)
+        db_inserted = False
+        local_indexed = False
+        try:
+            if self.db:
+                self.db.insert_memcell(memcell)
+                db_inserted = True
 
-        # FAISS
-        if embedding and self.faiss_vectors:
-            self.faiss_vectors.add(mem_id, embedding)
-        elif embedding:
-            self.vectors.add(mem_id, embedding)
+            self._index_memcell_locally(memcell)
+            local_indexed = True
 
-        # SQLite write-through
-        if self.db:
-            self.db.insert_memcell(memcell)
+            if embedding and self.faiss_vectors:
+                self.faiss_vectors.add(mem_id, embedding)
+            elif embedding:
+                self.vectors.add(mem_id, embedding)
+        except Exception:
+            if local_indexed:
+                self._rollback_local_memcell(memcell)
+            if db_inserted and self.db:
+                self.db.delete_memcell(mem_id)
+            raise
 
         self._incr_stat('total_memcells')
         return memcell
+
+    def _index_memcell_locally(self, memcell: MemCell):
+        self.memcells[memcell.id] = memcell
+        self.type_index[memcell.memory_type].add(memcell.id)
+        if memcell.source_doc:
+            self.source_index[memcell.source_doc].add(memcell.id)
+        self.bm25.add_document(memcell.id, memcell.keywords)
+
+    def _rollback_local_memcell(self, memcell: MemCell):
+        self.memcells.pop(memcell.id, None)
+        if memcell.memory_type in self.type_index:
+            self.type_index[memcell.memory_type].discard(memcell.id)
+        if memcell.source_doc in self.source_index:
+            self.source_index[memcell.source_doc].discard(memcell.id)
+            if not self.source_index[memcell.source_doc]:
+                self.source_index.pop(memcell.source_doc, None)
+        self.bm25.remove_document(memcell.id)
 
     def _connect(self, id1: str, id2: str):
         if id1 in self.memcells and id2 in self.memcells:
@@ -1603,14 +1726,14 @@ Return ONLY JSON."""
         emb_results = self._embedding_retrieval(query, top_k * 3)
 
         # Signal 3: Importance
-        importance_ranking = sorted(
-            self.memcells.values(), key=lambda m: m.importance, reverse=True
-        )[:top_k * 3]
+        importance_ranking = heapq.nlargest(
+            top_k * 3, self.memcells.values(), key=lambda m: m.importance
+        )
 
         # Signal 4: Recency
-        recency_ranking = sorted(
-            self.memcells.values(), key=lambda m: m.timestamp, reverse=True
-        )[:top_k * 3]
+        recency_ranking = heapq.nlargest(
+            top_k * 3, self.memcells.values(), key=lambda m: m.timestamp
+        )
 
         # RRF fusion (k=60)
         rrf_k = 60
@@ -2432,6 +2555,7 @@ class ScientificExplorer:
         no_gain_steps = 0
 
         for step in range(max_steps):
+            step_start = time.time()
             if status_callback:
                 status_callback(f"Epistemic policy {step+1}/{max_steps}")
 
@@ -2485,6 +2609,7 @@ class ScientificExplorer:
             ir['counterfactual_summary'] = counterfactual_report.get('summary')
             ir['causal_graph_delta'] = graph_report
             ir['project_update'] = project_update
+            ir['duration'] = time.time() - step_start
 
             if realized_gain < 0.01 and realized_kl_gain < 0.01:
                 no_gain_steps += 1
@@ -2983,8 +3108,8 @@ Return ONLY JSON."""
         experiments = self._design_experiments(topic, ranked)
         experiments = self._prioritize_experiments_falsification(experiments, ranked)
         if experiments:
-            state['experiments'].extend(experiments[:3])
-            state['protocols'].extend(experiments[:3])
+            self._append_unique_protocols(state['experiments'], experiments[:3])
+            self._append_unique_protocols(state['protocols'], experiments[:3])
             for exp in experiments[:3]:
                 idx = self._find_hypothesis_index(state['hypotheses'], exp.get('hypothesis', ''))
                 if idx is not None:
@@ -3636,13 +3761,15 @@ Return ONLY JSON."""
             relation = str(edge.get('relation', 'modulates')).strip().lower()
             if not source or not target:
                 continue
-            key = (source.lower(), target.lower(), relation)
+            source_id = self._resolve_or_create_causal_node(source, node_map, merged)
+            target_id = self._resolve_or_create_causal_node(target, node_map, merged)
+            key = (source_id.lower(), target_id.lower(), relation)
             if key in edge_keys:
                 continue
             edge_keys.add(key)
             merged['edges'].append({
-                'source': source[:64],
-                'target': target[:64],
+                'source': source_id[:64],
+                'target': target_id[:64],
                 'relation': relation[:32],
                 'confidence': self._clip(_safe_float(edge.get('confidence', 0.5), 0.5), 0.0, 1.0),
                 'status': str(edge.get('status', 'hypothesized')).strip().lower()[:32],
@@ -3662,7 +3789,33 @@ Return ONLY JSON."""
             if len(frontier) >= 8:
                 break
         merged['frontier_questions'] = frontier[:8]
+        valid_ids = {
+            str(node.get('id', '')).strip()
+            for node in merged['nodes']
+            if isinstance(node, dict) and str(node.get('id', '')).strip()
+        }
+        merged['edges'] = [
+            edge for edge in merged['edges']
+            if isinstance(edge, dict)
+            and str(edge.get('source', '')).strip() in valid_ids
+            and str(edge.get('target', '')).strip() in valid_ids
+        ]
         return merged
+
+    def _resolve_or_create_causal_node(self, ref: str, node_map: Dict[str, Dict[str, Any]],
+                                       merged: Dict[str, Any]) -> str:
+        token = str(ref).strip()
+        if not token:
+            return "n_unknown"
+        existing = node_map.get(token) or node_map.get(token.lower())
+        if existing:
+            return str(existing.get('id', token))[:64]
+        node_id = f"n_{hashlib.md5(token.lower().encode()).hexdigest()[:8]}"
+        entry = {'id': node_id, 'label': token[:120], 'type': 'factor'}
+        merged['nodes'].append(entry)
+        node_map[node_id] = entry
+        node_map[token.lower()] = entry
+        return node_id
 
     def _normalize_protocol_experiment(self, item: Dict[str, Any],
                                        fallback_hypothesis: str = "",
@@ -3685,8 +3838,13 @@ Return ONLY JSON."""
             controls = [str(controls)]
         protocol_id = str(item.get('protocol_id', '')).strip()
         if not protocol_id:
-            seed = f"{hypothesis}|{experiment}|{rank}"
-            protocol_id = f"prot_{hashlib.md5(seed.encode()).hexdigest()[:10]}"
+            seed = self._protocol_fingerprint({
+                'hypothesis': hypothesis,
+                'objective': item.get('objective', ''),
+                'measurement_plan': item.get('measurement_plan', measurable_outcome),
+                'failure_signal': failure_signal,
+            })
+            protocol_id = f"prot_{seed[:10]}"
         return {
             'protocol_id': protocol_id,
             'hypothesis': hypothesis[:200],
@@ -3716,6 +3874,15 @@ Return ONLY JSON."""
             'priority_score': self._clip(_safe_float(item.get('priority_score', 0.5), 0.5), 0.0, 1.0),
             'status': str(item.get('status', 'experiment_designed')).strip().lower()[:40],
         }
+
+    @staticmethod
+    def _protocol_fingerprint(item: Dict[str, Any]) -> str:
+        hypothesis = re.sub(r'\s+', ' ', str(item.get('hypothesis', '')).strip().lower())
+        objective = re.sub(r'\s+', ' ', str(item.get('objective', '')).strip().lower())
+        measurement = re.sub(r'\s+', ' ', str(item.get('measurement_plan', '')).strip().lower())
+        failure = re.sub(r'\s+', ' ', str(item.get('failure_signal', '')).strip().lower())
+        seed = f"{hypothesis}|{objective}|{measurement}|{failure}"
+        return hashlib.md5(seed.encode()).hexdigest()
 
     def _prioritize_experiments_falsification(self, experiments: List[Dict[str, Any]],
                                               ranked_hypotheses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3748,6 +3915,27 @@ Return ONLY JSON."""
             exp['execution_order'] = idx
         return normalized
 
+    def _append_unique_protocols(self, target: List[Dict[str, Any]],
+                                 candidates: List[Dict[str, Any]]):
+        seen = set()
+        for item in target:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get('protocol_id', '')).strip()
+            if pid:
+                seen.add(pid)
+                continue
+            seen.add(self._protocol_fingerprint(item))
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get('protocol_id', '')).strip()
+            key = pid if pid else self._protocol_fingerprint(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            target.append(item)
+
     def _build_protocol_package(self, topic: str, state: Dict[str, Any],
                                 iterations: List[Dict[str, Any]]) -> Dict[str, Any]:
         raw = []
@@ -3758,10 +3946,11 @@ Return ONLY JSON."""
         deduped: List[Dict[str, Any]] = []
         seen = set()
         for item in protocols:
-            pid = item.get('protocol_id')
-            if pid in seen:
+            pid = str(item.get('protocol_id', '')).strip()
+            key = pid if pid else self._protocol_fingerprint(item)
+            if key in seen:
                 continue
-            seen.add(pid)
+            seen.add(key)
             deduped.append(item)
         quality_checks = [
             "Each protocol contains explicit null hypothesis and failure signal.",

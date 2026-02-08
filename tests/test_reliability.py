@@ -3,7 +3,9 @@ import unittest
 from types import SimpleNamespace
 
 from core.synapse_brain import (
+    BM25,
     EMBEDDINGS_REQUIRED_ERROR,
+    EmbeddingProvider,
     LLM_REQUIRED_ERROR,
     SynapseBrain,
     _extract_first_json,
@@ -74,6 +76,27 @@ class ServiceGateTests(unittest.TestCase):
             brain.run_log_path = f"{run_dir}/run_test.jsonl"
             checks = brain.preflight_check()
         self.assertTrue(checks["ok"])
+
+
+class RetrievalPrimitiveTests(unittest.TestCase):
+    def test_bm25_remove_document(self):
+        bm = BM25()
+        bm.add_document("a", ["alpha", "beta", "beta"])
+        bm.add_document("b", ["alpha", "gamma"])
+        self.assertEqual(bm.corpus_size, 2)
+        bm.remove_document("a")
+        self.assertEqual(bm.corpus_size, 1)
+        self.assertNotIn("a", bm.doc_keywords)
+
+
+class EmbeddingErrorPolicyTests(unittest.TestCase):
+    def test_fatal_embedding_error_detection(self):
+        self.assertTrue(EmbeddingProvider._is_fatal_error("404 NOT_FOUND model is not found"))
+        self.assertTrue(EmbeddingProvider._is_fatal_error("401 unauthorized api key"))
+
+    def test_transient_embedding_error_detection(self):
+        self.assertFalse(EmbeddingProvider._is_fatal_error("deadline exceeded timeout"))
+        self.assertFalse(EmbeddingProvider._is_fatal_error("temporary network error"))
 
 
 if __name__ == "__main__":

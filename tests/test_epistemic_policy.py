@@ -125,6 +125,30 @@ class EpistemicPolicyTests(unittest.TestCase):
         self.assertIn("independent", protocol["variables"])
         self.assertIn("dependent", protocol["variables"])
 
+    def test_protocol_id_is_stable_across_rank(self):
+        one = self.explorer._normalize_protocol_experiment(
+            {"hypothesis": "A drives B", "experiment": "Perturb A and measure B"},
+            rank=1,
+        )
+        two = self.explorer._normalize_protocol_experiment(
+            {"hypothesis": "A drives B", "experiment": "Perturb A and measure B"},
+            rank=2,
+        )
+        self.assertEqual(one["protocol_id"], two["protocol_id"])
+
+    def test_append_unique_protocols_deduplicates(self):
+        target = []
+        p1 = self.explorer._normalize_protocol_experiment(
+            {"hypothesis": "A drives B", "experiment": "Perturb A and measure B"},
+            rank=1,
+        )
+        p2 = self.explorer._normalize_protocol_experiment(
+            {"hypothesis": "A drives B", "experiment": "Perturb A and measure B"},
+            rank=3,
+        )
+        self.explorer._append_unique_protocols(target, [p1, p2])
+        self.assertEqual(len(target), 1)
+
     def test_causal_graph_merge_deduplicates_edges(self):
         base = {
             "nodes": [{"id": "n_a", "label": "A", "type": "driver"}],
@@ -139,6 +163,16 @@ class EpistemicPolicyTests(unittest.TestCase):
         merged = self.explorer._merge_causal_graph(base, update)
         self.assertEqual(len(merged["edges"]), 1)
         self.assertEqual(len(merged["frontier_questions"]), 1)
+
+    def test_causal_graph_resolves_missing_nodes(self):
+        merged = self.explorer._merge_causal_graph(
+            {"nodes": [], "edges": [], "frontier_questions": []},
+            {"edges": [{"source": "driver_x", "target": "outcome_y", "relation": "increases"}]},
+        )
+        node_ids = {n["id"] for n in merged["nodes"]}
+        self.assertTrue(merged["edges"])
+        self.assertIn(merged["edges"][0]["source"], node_ids)
+        self.assertIn(merged["edges"][0]["target"], node_ids)
 
     def test_default_project_program_contains_milestones(self):
         program = self.explorer._default_project_program(
