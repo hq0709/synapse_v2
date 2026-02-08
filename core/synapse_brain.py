@@ -84,6 +84,9 @@ SYNAPSE_EXPLORER_MODE = os.getenv("SYNAPSE_EXPLORER_MODE", "epistemic_tools").st
 SYNAPSE_EPISTEMIC_LAMBDA_COST = float(os.getenv("SYNAPSE_EPISTEMIC_LAMBDA_COST", "0.15"))
 SYNAPSE_EPISTEMIC_MU_RISK = float(os.getenv("SYNAPSE_EPISTEMIC_MU_RISK", "0.10"))
 SYNAPSE_EPISTEMIC_STOP_ENTROPY = float(os.getenv("SYNAPSE_EPISTEMIC_STOP_ENTROPY", "0.35"))
+SYNAPSE_EPISTEMIC_COST_BUDGET = float(os.getenv("SYNAPSE_EPISTEMIC_COST_BUDGET", "0.28"))
+SYNAPSE_EPISTEMIC_RISK_BUDGET = float(os.getenv("SYNAPSE_EPISTEMIC_RISK_BUDGET", "0.12"))
+SYNAPSE_EPISTEMIC_DUAL_STEP = float(os.getenv("SYNAPSE_EPISTEMIC_DUAL_STEP", "0.08"))
 LLM_REQUIRED_ERROR = (
     "LLM is required but unavailable. Please install dependencies and set "
     "GEMINI_API_KEY in .env."
@@ -2298,6 +2301,9 @@ class ScientificExplorer:
         self.lambda_cost = SYNAPSE_EPISTEMIC_LAMBDA_COST
         self.mu_risk = SYNAPSE_EPISTEMIC_MU_RISK
         self.stop_entropy = SYNAPSE_EPISTEMIC_STOP_ENTROPY
+        self.cost_budget = max(0.01, SYNAPSE_EPISTEMIC_COST_BUDGET)
+        self.risk_budget = max(0.01, SYNAPSE_EPISTEMIC_RISK_BUDGET)
+        self.dual_step = max(0.001, SYNAPSE_EPISTEMIC_DUAL_STEP)
 
     def explore(self, topic: str, depth: int = 3,
                 status_callback: Callable = None) -> Dict[str, Any]:
@@ -2391,12 +2397,24 @@ class ScientificExplorer:
             'final_synthesis': None,
             'mode': 'epistemic_tools',
             'epistemic_policy': {
-                'objective': 'maximize(expected_information_gain - lambda_cost*cost - mu_risk*risk)',
+                'objective': (
+                    'maximize E[DeltaI_t] subject to E[cost_t]<=C, E[risk_t]<=R; '
+                    'implemented via dual ascent on L(a,lambda,mu)=E[DeltaI]-lambda(cost-C)-mu(risk-R)'
+                ),
                 'lambda_cost': self.lambda_cost,
                 'mu_risk': self.mu_risk,
+                'cost_budget': self.cost_budget,
+                'risk_budget': self.risk_budget,
+                'dual_step': self.dual_step,
                 'stop_entropy': self.stop_entropy,
+                'assumptions': [
+                    'bounded per-step gain/cost/risk proxies',
+                    'bounded evidence deltas in log-odds update',
+                    'projected dual ascent for lambda/mu'
+                ],
                 'tool_trace': [],
                 'total_information_gain': 0.0,
+                'total_kl_gain': 0.0,
                 'final_entropy': 1.0,
                 'stop_reason': 'budget_exhausted'
             }
@@ -2410,24 +2428,45 @@ class ScientificExplorer:
                 status_callback(f"Epistemic policy {step+1}/{max_steps}")
 
             entropy_before = self._belief_entropy(state['hypotheses'])
+            prior_probs = self._belief_distribution(state['hypotheses'])
             action, expected = self._select_epistemic_tool(state, step, max_steps)
             ir = self._execute_epistemic_tool(
                 action=action, topic=topic, state=state, step=step + 1, total=max_steps
             )
+            self._normalize_hypothesis_beliefs(state['hypotheses'])
             entropy_after = self._belief_entropy(state['hypotheses'])
             realized_gain = max(0.0, entropy_before - entropy_after)
+            posterior_probs = self._belief_distribution(state['hypotheses'])
+            realized_kl_gain = self._kl_divergence(posterior_probs, prior_probs)
+            observed_cost = self._clip(_safe_float(ir.get('observed_cost', expected['cost']), expected['cost']), 0.0, 1.0)
+            observed_risk = self._clip(_safe_float(ir.get('observed_risk', expected['risk']), expected['risk']), 0.0, 1.0)
+
+            state['dual_lambda'] = self._clip(
+                state.get('dual_lambda', self.lambda_cost) + self.dual_step * (observed_cost - self.cost_budget),
+                0.0, 5.0
+            )
+            state['dual_mu'] = self._clip(
+                state.get('dual_mu', self.mu_risk) + self.dual_step * (observed_risk - self.risk_budget),
+                0.0, 5.0
+            )
             state['total_information_gain'] += realized_gain
+            state['total_kl_gain'] += realized_kl_gain
             ir['selected_tool'] = action
             ir['expected_utility'] = expected['utility']
             ir['expected_information_gain'] = expected['expected_information_gain']
             ir['expected_cost'] = expected['cost']
             ir['expected_risk'] = expected['risk']
+            ir['observed_cost'] = observed_cost
+            ir['observed_risk'] = observed_risk
+            ir['dual_lambda'] = state['dual_lambda']
+            ir['dual_mu'] = state['dual_mu']
             ir['entropy_before'] = entropy_before
             ir['entropy_after'] = entropy_after
             ir['realized_information_gain'] = realized_gain
+            ir['realized_kl_gain'] = realized_kl_gain
             ir['belief_snapshot'] = self._rank_state_hypotheses(state['hypotheses'])[:3]
 
-            if realized_gain < 0.01:
+            if realized_gain < 0.01 and realized_kl_gain < 0.01:
                 no_gain_steps += 1
             else:
                 no_gain_steps = 0
@@ -2439,8 +2478,13 @@ class ScientificExplorer:
                 'expected_utility': expected['utility'],
                 'expected_information_gain': expected['expected_information_gain'],
                 'realized_information_gain': realized_gain,
+                'realized_kl_gain': realized_kl_gain,
                 'entropy_before': entropy_before,
                 'entropy_after': entropy_after,
+                'observed_cost': observed_cost,
+                'observed_risk': observed_risk,
+                'dual_lambda': state['dual_lambda'],
+                'dual_mu': state['dual_mu'],
                 'reason': expected['reason'],
             })
 
@@ -2452,9 +2496,12 @@ class ScientificExplorer:
                 break
 
         result['epistemic_policy']['total_information_gain'] = state['total_information_gain']
+        result['epistemic_policy']['total_kl_gain'] = state['total_kl_gain']
         result['epistemic_policy']['final_entropy'] = self._belief_entropy(state['hypotheses'])
         result['epistemic_policy']['final_hypotheses'] = self._rank_state_hypotheses(state['hypotheses'])[:5]
         result['epistemic_policy']['experiments_generated'] = len(state['experiments'])
+        result['epistemic_policy']['final_dual_lambda'] = state.get('dual_lambda', self.lambda_cost)
+        result['epistemic_policy']['final_dual_mu'] = state.get('dual_mu', self.mu_risk)
 
         if status_callback:
             status_callback("Writing final synthesis")
@@ -2571,6 +2618,8 @@ Return ONLY JSON array."""
                 "testability_score": 0.4
             })
 
+        self._normalize_hypothesis_beliefs(hypotheses)
+
         return {
             'hypotheses': hypotheses,
             'retrieved': retrieved,
@@ -2578,7 +2627,10 @@ Return ONLY JSON array."""
             'experiments': [],
             'action_history': [],
             'total_information_gain': 0.0,
-            'last_gaps': []
+            'total_kl_gain': 0.0,
+            'last_gaps': [],
+            'dual_lambda': self.lambda_cost,
+            'dual_mu': self.mu_risk
         }
 
     def _select_epistemic_tool(self, state: Dict[str, Any], step: int, max_steps: int) -> Tuple[str, Dict[str, Any]]:
@@ -2640,11 +2692,19 @@ Return ONLY JSON array."""
             risk = 0.12
             reason = "Belief recalibration improves posterior calibration and stopping confidence."
 
-        utility = expected_gain - self.lambda_cost * cost - self.mu_risk * risk
+        dual_lambda = _safe_float(state.get('dual_lambda', self.lambda_cost), self.lambda_cost)
+        dual_mu = _safe_float(state.get('dual_mu', self.mu_risk), self.mu_risk)
+        utility = (
+            expected_gain
+            - dual_lambda * (cost - self.cost_budget)
+            - dual_mu * (risk - self.risk_budget)
+        )
         return {
             'expected_information_gain': expected_gain,
             'cost': cost,
             'risk': risk,
+            'dual_lambda': dual_lambda,
+            'dual_mu': dual_mu,
             'utility': utility,
             'reason': reason
         }
@@ -2722,10 +2782,14 @@ Return ONLY JSON."""
 
         if not insights and retrieved:
             insights = [f"Retrieved {len(retrieved)} evidence items to refine posterior beliefs."]
+        observed_cost = self._clip(0.18 + 0.015 * len(retrieved[:12]), 0.0, 1.0)
+        observed_risk = self._clip(0.08 + (0.06 if not updates else 0.02), 0.0, 1.0)
         return {
             'gaps': gaps[:3],
             'insights': insights[:3],
-            'feedback': {'retrieved_items': len(retrieved)}
+            'feedback': {'retrieved_items': len(retrieved)},
+            'observed_cost': observed_cost,
+            'observed_risk': observed_risk,
         }
 
     def _tool_propose_hypotheses(self, topic: str, state: Dict[str, Any],
@@ -2754,9 +2818,13 @@ Return ONLY JSON array."""
         insights = []
         if new_hypotheses:
             insights.append(f"Expanded hypothesis space with {len(new_hypotheses)} candidate mechanisms.")
+        observed_cost = self._clip(0.12 + 0.07 * len(new_hypotheses), 0.0, 1.0)
+        observed_risk = self._clip(0.12 + (0.08 if not new_hypotheses else 0.04), 0.0, 1.0)
         return {
             'hypotheses': new_hypotheses[:3],
-            'insights': insights[:3]
+            'insights': insights[:3],
+            'observed_cost': observed_cost,
+            'observed_risk': observed_risk,
         }
 
     def _tool_audit_contradictions(self, topic: str, state: Dict[str, Any],
@@ -2802,9 +2870,13 @@ Return ONLY JSON."""
         self._apply_hypothesis_updates(state['hypotheses'], updates)
         if not insights and contradiction_notes:
             insights = [f"Detected {len(contradiction_notes)} contradiction signals to down-weight brittle hypotheses."]
+        observed_cost = self._clip(0.16 + 0.03 * len(contradiction_notes[:6]), 0.0, 1.0)
+        observed_risk = self._clip(0.05 + (0.04 if contradiction_notes else 0.08), 0.0, 1.0)
         return {
             'insights': insights[:3],
-            'feedback': {'weaknesses': weaknesses[:4], 'contradiction_signals': len(contradiction_notes)}
+            'feedback': {'weaknesses': weaknesses[:4], 'contradiction_signals': len(contradiction_notes)},
+            'observed_cost': observed_cost,
+            'observed_risk': observed_risk,
         }
 
     def _tool_design_experiments(self, topic: str, state: Dict[str, Any],
@@ -2821,10 +2893,14 @@ Return ONLY JSON."""
         insights = []
         if experiments:
             insights = [f"Designed {len(experiments[:3])} minimum-viable experiments to maximize falsifiability."]
+        observed_cost = self._clip(0.14 + 0.06 * len(experiments[:3]), 0.0, 1.0)
+        observed_risk = self._clip(0.04 + (0.05 if not experiments else 0.02), 0.0, 1.0)
         return {
             'ranked_hypotheses': ranked[:3],
             'experiments': experiments[:3],
-            'insights': insights[:2]
+            'insights': insights[:2],
+            'observed_cost': observed_cost,
+            'observed_risk': observed_risk,
         }
 
     def _tool_recalibrate_beliefs(self, topic: str, state: Dict[str, Any],
@@ -2861,12 +2937,17 @@ Return ONLY JSON array."""
         if ranked:
             strongest = ranked[0].get('hypothesis', '')[:130]
             insights.append(f"Posterior recalibrated; strongest current hypothesis: {strongest}")
+        observed_cost = 0.15
+        observed_risk = 0.05 if response else 0.10
         return {
             'ranked_hypotheses': ranked[:3],
-            'insights': insights[:2]
+            'insights': insights[:2],
+            'observed_cost': observed_cost,
+            'observed_risk': observed_risk,
         }
 
     def _rank_state_hypotheses(self, hypotheses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        self._normalize_hypothesis_beliefs(hypotheses)
         ranked = []
         for item in hypotheses:
             belief = self._clip(_safe_float(item.get('belief', 0.5), 0.5), 0.0, 1.0)
@@ -2896,11 +2977,17 @@ Return ONLY JSON array."""
                 h['belief'] = self._clip(_safe_float(upd.get('support_delta', h.get('belief', 0.5)), h.get('belief', 0.5)), 0.0, 1.0)
                 h['uncertainty'] = self._clip(_safe_float(upd.get('uncertainty_delta', h.get('uncertainty', 0.5)), h.get('uncertainty', 0.5)), 0.0, 1.0)
             else:
-                h['belief'] = self._clip(h.get('belief', 0.5) + _safe_float(upd.get('support_delta', 0.0), 0.0), 0.0, 1.0)
-                h['uncertainty'] = self._clip(h.get('uncertainty', 0.5) + _safe_float(upd.get('uncertainty_delta', 0.0), 0.0), 0.0, 1.0)
+                evidence_delta = self._clip(_safe_float(upd.get('support_delta', 0.0), 0.0), -0.5, 0.5)
+                h['belief'] = self._bayes_update_from_delta(h.get('belief', 0.5), evidence_delta)
+                default_uncertainty_delta = -0.18 * abs(evidence_delta)
+                h['uncertainty'] = self._clip(
+                    h.get('uncertainty', 0.5) + _safe_float(upd.get('uncertainty_delta', default_uncertainty_delta), default_uncertainty_delta),
+                    0.0, 1.0
+                )
             note = upd.get('evidence_note')
             if note and isinstance(note, str):
                 h['latest_update_note'] = note[:240]
+        self._normalize_hypothesis_beliefs(hypotheses)
 
     def _add_state_hypothesis(self, hypotheses: List[Dict[str, Any]], item: Dict[str, Any]) -> bool:
         hypothesis_text = str(item.get('hypothesis', '')).strip()
@@ -2942,15 +3029,59 @@ Return ONLY JSON array."""
             return best_idx
         return None
 
-    @staticmethod
-    def _belief_entropy(hypotheses: List[Dict[str, Any]]) -> float:
+    def _normalize_hypothesis_beliefs(self, hypotheses: List[Dict[str, Any]]):
         if not hypotheses:
-            return 1.0
+            return
+        raw = [max(1e-6, self._clip(_safe_float(h.get('belief', 0.5), 0.5), 1e-6, 1.0)) for h in hypotheses]
+        total = sum(raw)
+        if total <= 0:
+            uniform = 1.0 / len(hypotheses)
+            for h in hypotheses:
+                h['belief'] = uniform
+            return
+        for i, h in enumerate(hypotheses):
+            h['belief'] = raw[i] / total
+
+    @staticmethod
+    def _bayes_update_from_delta(prior_belief: float, evidence_delta: float, sensitivity: float = 2.4) -> float:
+        """
+        Bayesian-style update in log-odds space.
+        evidence_delta in [-0.5, 0.5] is mapped to a bounded log-likelihood ratio.
+        """
+        p = max(1e-6, min(1.0 - 1e-6, _safe_float(prior_belief, 0.5)))
+        logit = math.log(p / (1.0 - p))
+        llr = sensitivity * _safe_float(evidence_delta, 0.0)
+        posterior = 1.0 / (1.0 + math.exp(-(logit + llr)))
+        return float(max(1e-6, min(1.0 - 1e-6, posterior)))
+
+    @staticmethod
+    def _belief_distribution(hypotheses: List[Dict[str, Any]]) -> List[float]:
+        if not hypotheses:
+            return []
         weights = [max(1e-6, _safe_float(h.get('belief', 0.0), 0.0)) for h in hypotheses]
         total = sum(weights)
         if total <= 0:
+            return [1.0 / len(hypotheses)] * len(hypotheses)
+        return [w / total for w in weights]
+
+    @staticmethod
+    def _kl_divergence(posterior: List[float], prior: List[float]) -> float:
+        if not posterior or not prior:
+            return 0.0
+        n = min(len(posterior), len(prior))
+        eps = 1e-9
+        val = 0.0
+        for i in range(n):
+            q = max(eps, posterior[i])
+            p = max(eps, prior[i])
+            val += q * math.log(q / p)
+        return float(max(0.0, val))
+
+    @staticmethod
+    def _belief_entropy(hypotheses: List[Dict[str, Any]]) -> float:
+        probs = ScientificExplorer._belief_distribution(hypotheses)
+        if not probs:
             return 1.0
-        probs = [w / total for w in weights]
         n = len(probs)
         if n <= 1:
             return 0.0
@@ -3381,7 +3512,10 @@ class SynapseBrain:
             "ranked_hypotheses_count": len(first_iter.get("ranked_hypotheses", [])),
             "experiments_count": len(first_iter.get("experiments", [])),
             "epistemic_information_gain": (result.get("epistemic_policy") or {}).get("total_information_gain"),
+            "epistemic_kl_gain": (result.get("epistemic_policy") or {}).get("total_kl_gain"),
             "epistemic_final_entropy": (result.get("epistemic_policy") or {}).get("final_entropy"),
+            "epistemic_final_dual_lambda": (result.get("epistemic_policy") or {}).get("final_dual_lambda"),
+            "epistemic_final_dual_mu": (result.get("epistemic_policy") or {}).get("final_dual_mu"),
             "epistemic_stop_reason": (result.get("epistemic_policy") or {}).get("stop_reason"),
             "error": result.get("error")
         })
@@ -3413,6 +3547,10 @@ class SynapseBrain:
             'episodes': len(self.memory.episodes),
             'conversation_length': len(self.qa.conversation_history),
             'vector_backend': 'faiss' if has_faiss_backend else 'in-memory',
+            'explorer_mode': self.explorer.mode,
+            'epistemic_cost_budget': self.explorer.cost_budget,
+            'epistemic_risk_budget': self.explorer.risk_budget,
+            'epistemic_dual_step': self.explorer.dual_step,
             'storage': (
                 'sqlite+faiss' if self.memory.db and has_faiss_backend
                 else 'sqlite+in-memory' if self.memory.db
@@ -3436,6 +3574,10 @@ class SynapseBrain:
             'storage_dir_exists': os.path.isdir(self.memory_dir),
             'run_log_parent_exists': os.path.isdir(run_log_parent),
             'run_log_writable': os.access(run_log_parent, os.W_OK) if os.path.isdir(run_log_parent) else False,
+            'explorer_mode': self.explorer.mode,
+            'epistemic_cost_budget': self.explorer.cost_budget,
+            'epistemic_risk_budget': self.explorer.risk_budget,
+            'epistemic_dual_step': self.explorer.dual_step,
             'vector_backend': 'faiss' if self.memory.faiss_vectors and self.memory.faiss_vectors.index is not None else 'in-memory',
             'faiss_vectors': self.memory.faiss_vectors.size if self.memory.faiss_vectors else 0,
             'in_memory_vectors': len(self.memory.vectors.embeddings),

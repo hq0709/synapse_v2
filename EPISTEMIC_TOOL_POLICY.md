@@ -1,84 +1,164 @@
 # Epistemic Tool Policy for Scientific Exploration
 
-This document specifies the theoretical core of Synapse's tool-based scientific exploration mode.
+This document gives a formal derivation of Synapse's tool-based scientific exploration policy.
+The implementation lives in `/Users/henryjiang/Desktop/synapse_v2/core/synapse_brain.py` under `ScientificExplorer` in `epistemic_tools` mode.
 
-## Core idea
+## 1) Problem formulation: constrained epistemic control
 
-Scientific discovery is formulated as a sequential decision process over a hypothesis posterior.
-At each step, the agent selects the tool that maximizes expected epistemic value under cost and risk constraints.
+Let `H={h_1,...,h_n}` be the active hypothesis set for a topic.
+At decision step `t`, the agent state is:
 
-## State
+- posterior proxy `b_t(h_i)` with `sum_i b_t(h_i)=1`
+- uncertainty scores `u_t(h_i) in [0,1]`
+- evidence context `E_t`
+- tool action history `a_{1:t-1}`
 
-At step `t`, the agent tracks an epistemic state:
+The agent chooses a tool `a_t` from a finite tool set `A`.
+Tool execution yields observation `o_t` (retrieved evidence, contradiction signals, calibration output, or experiment plans).
 
-- `H_t = {h_i}`: hypothesis set
-- `b_t(h_i)`: belief (posterior proxy) for hypothesis `h_i`
-- `u_t(h_i)`: uncertainty for hypothesis `h_i`
-- `E_t`: evidence memory context
-- `A_{<t}`: action history
+The theoretical objective is a constrained optimization:
 
-Normalized entropy over belief mass is used as a stopping/control signal:
+maximize `sum_t E[Delta I_t]`
+subject to `E[c_t] <= C` and `E[r_t] <= R`
 
-`Entropy(b_t) = -sum_i p_i log p_i / log |H_t|` where `p_i = b_t(h_i) / sum_j b_t(h_j)`.
+where:
 
-## Tool selection objective
+- `Delta I_t` is epistemic gain
+- `c_t` is per-step computational/operational cost
+- `r_t` is per-step epistemic risk (overconfidence, brittle inference)
+- `C,R` are user-specified budgets
 
-The policy chooses tool `a_t` by:
+This is a constrained partially observed control problem over belief states.
 
-`a_t = argmax_a [ E[Delta I(H; O | a, b_t)] - lambda * Cost(a) - mu * Risk(a) ]`
+## 2) Lagrangian relaxation and dual policy
 
-Implementation uses calibrated proxies:
+We optimize the per-step relaxed objective:
 
-- expected information gain (`expected_information_gain`)
-- execution cost (`cost`)
-- epistemic risk (`risk`, e.g., hallucination/overconfidence risk)
-- utility = `expected_information_gain - lambda_cost * cost - mu_risk * risk`
+`L_t(a; lambda_t, mu_t) = E[Delta I_t | a, s_t] - lambda_t (E[c_t|a,s_t]-C) - mu_t (E[r_t|a,s_t]-R)`
 
-## Tool set
+Tool choice:
 
-Current tools:
+`a_t = argmax_{a in A} L_t(a; lambda_t, mu_t)`
 
-1. `retrieve_evidence`
-2. `propose_hypotheses`
-3. `audit_contradictions`
-4. `design_experiments`
-5. `recalibrate_beliefs`
+Dual updates (projected subgradient ascent):
 
-Each tool emits structured updates:
+`lambda_{t+1} = [lambda_t + eta (c_t - C)]_+`
+`mu_{t+1}     = [mu_t     + eta (r_t - R)]_+`
 
-- belief deltas (`support_delta`)
-- uncertainty deltas (`uncertainty_delta`)
-- new hypotheses or experiment plans
-- qualitative insight traces
+with step size `eta > 0`, and `[x]_+ = max(0,x)`.
 
-## Stopping rules
+Interpretation:
 
-Exploration stops when one of the following is met:
+- if observed cost exceeds budget, `lambda` increases and expensive tools are penalized more
+- if observed risk exceeds budget, `mu` increases and risky tools are penalized more
 
-1. `Entropy(b_t) <= stop_entropy` and at least one experiment plan exists.
-2. Realized information gain plateaus for consecutive steps.
-3. Step budget exhausted.
+This gives adaptive regularization rather than fixed heuristics.
 
-## Logged quantities
+## 3) Belief update model
+
+For each hypothesis we maintain `b_t(h)`.
+For non-absolute tool updates we use bounded log-odds Bayesian updates:
+
+`logit(b_{t+1}(h)) = logit(b_t(h)) + kappa * delta_t(h)`
+
+where:
+
+- `delta_t(h)` is tool-provided signed evidence signal, clipped to a bounded interval
+- `kappa` is a sensitivity constant
+
+Then probabilities are normalized over hypotheses to enforce simplex constraints.
+
+Uncertainty update uses tool-specific deltas plus conservative shrinkage under stronger evidence magnitude.
+
+### Why this matters
+
+It removes arbitrary additive belief jumps and enforces stable posterior dynamics in probability space.
+
+## 4) Information gain definition
+
+Two gains are tracked:
+
+1. Entropy drop (normalized Shannon entropy)
+
+`Delta H_t = max(0, H(b_t) - H(b_{t+1}))`
+
+2. KL gain (posterior shift relative to prior)
+
+`Delta KL_t = D_KL(b_{t+1} || b_t)`
+
+with `D_KL(p||q) = sum_i p_i log(p_i/q_i)`.
+
+`Delta KL_t >= 0` always, giving a non-negative progress signal even when entropy is flat.
+
+## 5) Stopping rule
+
+Exploration halts if one of the following holds:
+
+1. low posterior entropy and at least one concrete experiment is produced
+2. information-gain plateau for consecutive steps
+3. step budget exhausted
+
+This defines an anytime policy: it can stop early when the posterior is concentrated enough for action.
+
+## 6) Theoretical properties (under standard assumptions)
+
+Assume bounded per-step gain/cost/risk and bounded stochastic noise in tool observations.
+
+### Proposition 1: Posterior validity
+Belief normalization after each update ensures `b_t` remains in the probability simplex for all `t`.
+
+### Proposition 2: KL non-negativity
+For every step, `Delta KL_t >= 0` by Gibbs inequality.
+
+### Proposition 3: Dual feasibility tendency
+Under convex surrogate losses and standard diminishing step-size conditions, projected dual ascent drives average constraint violation toward zero in expectation.
+
+### Proposition 4: Bounded-update stability
+With clipped evidence signals and bounded sensitivity, single-step log-odds updates are bounded, preventing catastrophic posterior collapse in one action.
+
+These are the core reasons the policy is mathematically constrained and auditable, not free-form chain-of-thought tool use.
+
+## 7) Algorithm sketch
+
+1. Initialize hypothesis set and normalized beliefs from retrieved evidence.
+2. At each step:
+   - estimate per-tool expected gain/cost/risk
+   - choose `argmax` relaxed Lagrangian utility
+   - execute tool, obtain structured observation
+   - perform Bayesian-style posterior update
+   - compute entropy/KL gains
+   - update dual variables `(lambda, mu)`
+3. stop by entropy or plateau condition
+4. emit ranked hypotheses + experiment plan + audit trace
+
+## 8) What is logged for reproducibility
 
 Each step logs:
 
 - selected tool
-- expected utility and expected information gain
-- realized information gain (entropy drop)
-- entropy before/after update
+- expected utility and expected IG
+- realized entropy gain and realized KL gain
+- observed cost/risk
+- dual variables `lambda, mu`
+- entropy before/after
 
-Run-level summary logs:
+Run summary logs:
 
-- total information gain
+- total entropy gain
+- total KL gain
 - final entropy
+- final dual variables
 - stopping reason
 
-## Why this is not generic tool-use
+These are sufficient to replay and diagnose policy behavior without hidden state.
 
-This framework is not plain ReAct. Tool selection is constrained by a quantitative epistemic objective and explicit stopping criteria, enabling reproducible evaluation of:
+## 9) Why this is stronger than generic tool-use
 
-- posterior concentration dynamics
-- gain-per-step efficiency
-- contradiction robustness
-- experiment planning quality under uncertainty
+Generic tool-use frameworks decide actions heuristically.
+This policy explicitly optimizes an epistemic objective with constraint handling and normalized posterior dynamics.
+That gives:
+
+- formally interpretable decision traces
+- principled cost-risk tradeoffs
+- mathematically controlled stopping
+- clearer path to theorem-backed analysis and review-ready methodology sections

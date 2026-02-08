@@ -358,7 +358,12 @@ class Synapse:
             policy = result['epistemic_policy']
             print(
                 f"\n{C.D}Epistemic policy | total IG: {policy.get('total_information_gain', 0.0):.3f} | "
+                f"total KL: {policy.get('total_kl_gain', 0.0):.3f} | "
                 f"final entropy: {policy.get('final_entropy', 0.0):.3f} | stop: {policy.get('stop_reason', 'n/a')}{C.R}"
+            )
+            print(
+                f"{C.D}Dual vars: lambda={policy.get('final_dual_lambda', 0.0):.3f}, "
+                f"mu={policy.get('final_dual_mu', 0.0):.3f}{C.R}"
             )
 
         print(f"\n{C.D}Duration: {result.get('total_duration', 0):.1f}s | Saved to memory{C.R}\n")
@@ -373,6 +378,7 @@ class Synapse:
         print(f"  LLM: {'Connected' if stats['llm_available'] else 'Offline'}")
         print(f"  Embeddings: {'Connected' if stats.get('embeddings_available') else 'Offline'}")
         print(f"  Vector backend: {stats.get('vector_backend', 'unknown')}")
+        print(f"  Explorer mode: {stats.get('explorer_mode', 'unknown')}")
         print(f"  LLM calls: {stats['llm_calls']}")
         print(f"  Memories: {mem['total_memcells']}")
         print(f"  Episodes: {mem['total_episodes']}")
@@ -381,6 +387,8 @@ class Synapse:
         print(f"  Retrievals: {mem['total_retrievals']}")
         print(f"  FAISS vectors: {stats.get('faiss_vectors', 0)}")
         print(f"  In-memory vectors: {stats.get('in_memory_vectors', 0)}")
+        print(f"  Epistemic budgets: cost={stats.get('epistemic_cost_budget', 0.0):.2f}, risk={stats.get('epistemic_risk_budget', 0.0):.2f}")
+        print(f"  Dual step: {stats.get('epistemic_dual_step', 0.0):.3f}")
         print(f"  Conversations: {stats['conversation_length']}")
 
         if stats['profiles']:

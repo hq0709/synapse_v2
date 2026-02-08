@@ -41,6 +41,12 @@ class ServiceGateTests(unittest.TestCase):
             faiss_vectors=SimpleNamespace(index=None, size=0),
             vectors=SimpleNamespace(embeddings={}),
         )
+        brain.explorer = SimpleNamespace(
+            mode="epistemic_tools",
+            cost_budget=0.28,
+            risk_budget=0.12,
+            dual_step=0.08,
+        )
         return brain
 
     def test_service_gate_rejects_missing_llm(self):

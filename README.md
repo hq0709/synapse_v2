@@ -32,6 +32,9 @@ Environment variables:
 - `SYNAPSE_EPISTEMIC_LAMBDA_COST`: cost penalty in epistemic tool utility.
 - `SYNAPSE_EPISTEMIC_MU_RISK`: risk penalty in epistemic tool utility.
 - `SYNAPSE_EPISTEMIC_STOP_ENTROPY`: stopping threshold for posterior entropy.
+- `SYNAPSE_EPISTEMIC_COST_BUDGET`: average per-step cost budget in constrained optimization.
+- `SYNAPSE_EPISTEMIC_RISK_BUDGET`: average per-step risk budget in constrained optimization.
+- `SYNAPSE_EPISTEMIC_DUAL_STEP`: dual ascent step size for lambda/mu updates.
 - `SYNAPSE_MEMORY_DIR`: persistent memory directory (default `.synapse_memory`).
 
 ## LLM requirement
@@ -96,5 +99,6 @@ Details: `evaluation/README.md`
 - QA evidence retrieval is now purity-filtered to `ATOMIC_FACT` and `EPISODE` only.
 - Long documents are processed with chunked extraction and hierarchical summarization.
 - FAISS is used by default for vector retrieval speed; if unavailable at runtime, retrieval falls back to in-memory cosine search.
-- Scientific exploration now defaults to an epistemic tool policy that selects tools by expected information gain minus cost/risk penalties.
+- Scientific exploration now defaults to an epistemic tool policy that uses constrained optimization with dual ascent and KL-based information gain tracking.
 - Theory and formal objective: `EPISTEMIC_TOOL_POLICY.md`.
+- Extended derivations and proof sketches: `THEORY_APPENDIX.md`.
