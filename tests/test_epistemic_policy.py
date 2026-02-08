@@ -90,6 +90,64 @@ class EpistemicPolicyTests(unittest.TestCase):
         u_high = self.explorer._estimate_tool_utility(state_high_penalty, "retrieve_evidence", step=0, max_steps=5)["utility"]
         self.assertGreater(u_low, u_high)
 
+    def test_falsification_first_ranking(self):
+        hypotheses = [
+            {
+                "hypothesis": "Conservative but weakly falsifiable claim",
+                "belief": 0.8,
+                "uncertainty": 0.2,
+                "testability_score": 0.8,
+                "falsifiability_score": 0.1,
+                "novelty_score": 0.5,
+            },
+            {
+                "hypothesis": "High-risk highly falsifiable mechanism",
+                "belief": 0.55,
+                "uncertainty": 0.7,
+                "testability_score": 0.7,
+                "falsifiability_score": 0.95,
+                "novelty_score": 0.5,
+            },
+        ]
+        ranked = self.explorer._rank_state_hypotheses(hypotheses)
+        self.assertEqual(ranked[0]["hypothesis"], "High-risk highly falsifiable mechanism")
+
+    def test_protocol_normalization_has_required_fields(self):
+        protocol = self.explorer._normalize_protocol_experiment(
+            {"hypothesis": "A drives B", "experiment": "Perturb A and measure B"},
+            rank=1,
+        )
+        required = {
+            "protocol_id", "objective", "null_hypothesis", "variables",
+            "analysis_plan", "failure_signal", "falsification_strength",
+        }
+        self.assertTrue(required.issubset(set(protocol.keys())))
+        self.assertIn("independent", protocol["variables"])
+        self.assertIn("dependent", protocol["variables"])
+
+    def test_causal_graph_merge_deduplicates_edges(self):
+        base = {
+            "nodes": [{"id": "n_a", "label": "A", "type": "driver"}],
+            "edges": [{"source": "n_a", "target": "n_b", "relation": "increases", "confidence": 0.7, "status": "hypothesized", "evidence": "x"}],
+            "frontier_questions": [],
+        }
+        update = {
+            "nodes": [{"id": "n_a", "label": "A", "type": "driver"}],
+            "edges": [{"source": "n_a", "target": "n_b", "relation": "increases", "confidence": 0.8, "status": "supported", "evidence": "y"}],
+            "frontier_questions": ["What is confound C?"],
+        }
+        merged = self.explorer._merge_causal_graph(base, update)
+        self.assertEqual(len(merged["edges"]), 1)
+        self.assertEqual(len(merged["frontier_questions"]), 1)
+
+    def test_default_project_program_contains_milestones(self):
+        program = self.explorer._default_project_program(
+            "battery degradation",
+            [{"hypothesis": "Interphase growth drives fade", "belief": 0.6, "uncertainty": 0.6}],
+        )
+        self.assertTrue(program["milestones"])
+        self.assertIn("north_star_question", program)
+
 
 if __name__ == "__main__":
     unittest.main()

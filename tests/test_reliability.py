@@ -46,6 +46,9 @@ class ServiceGateTests(unittest.TestCase):
             cost_budget=0.28,
             risk_budget=0.12,
             dual_step=0.08,
+            falsification_weight=0.68,
+            project_horizon=3,
+            counterfactual_branches=3,
         )
         return brain
 

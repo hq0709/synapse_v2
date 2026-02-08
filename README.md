@@ -35,6 +35,9 @@ Environment variables:
 - `SYNAPSE_EPISTEMIC_COST_BUDGET`: average per-step cost budget in constrained optimization.
 - `SYNAPSE_EPISTEMIC_RISK_BUDGET`: average per-step risk budget in constrained optimization.
 - `SYNAPSE_EPISTEMIC_DUAL_STEP`: dual ascent step size for lambda/mu updates.
+- `SYNAPSE_FALSIFICATION_WEIGHT`: relative weight for falsification-first hypothesis/experiment ordering.
+- `SYNAPSE_PROJECT_HORIZON`: number of milestones tracked in long-horizon project progression.
+- `SYNAPSE_COUNTERFACTUAL_BRANCHES`: max counterfactual scenarios generated per exploration step.
 - `SYNAPSE_MEMORY_DIR`: persistent memory directory (default `.synapse_memory`).
 
 ## LLM requirement
@@ -100,5 +103,7 @@ Details: `evaluation/README.md`
 - Long documents are processed with chunked extraction and hierarchical summarization.
 - FAISS is used by default for vector retrieval speed; if unavailable at runtime, retrieval falls back to in-memory cosine search.
 - Scientific exploration now defaults to an epistemic tool policy that uses constrained optimization with dual ascent and KL-based information gain tracking.
+- Exploration includes integrated project progression, counterfactual lab, causal graph updates, and protocol-grade experiment outputs.
+- Experiment planning is falsification-first and emits structured protocol fields (null hypothesis, confound mitigation, analysis/stopping rules).
 - Theory and formal objective: `EPISTEMIC_TOOL_POLICY.md`.
 - Extended derivations and proof sketches: `THEORY_APPENDIX.md`.

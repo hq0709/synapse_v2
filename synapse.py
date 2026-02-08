@@ -301,6 +301,12 @@ class Synapse:
             if it.get('selected_tool'):
                 print(f"{C.D}Tool: {it.get('selected_tool')} | expected IG={it.get('expected_information_gain', 0.0):.3f} | realized IG={it.get('realized_information_gain', 0.0):.3f}{C.R}")
                 print(f"{C.D}Entropy: {it.get('entropy_before', 0.0):.3f} -> {it.get('entropy_after', 0.0):.3f}{C.R}")
+            if it.get('project_update'):
+                pu = it['project_update']
+                print(f"{C.D}Project: stage={pu.get('current_stage', 'n/a')} | progress={pu.get('project_progress', 0.0):.2f}{C.R}")
+            if it.get('causal_graph_delta'):
+                cg = it['causal_graph_delta']
+                print(f"{C.D}Causal graph: +{cg.get('edges_added', 0)} edges, total={cg.get('total_edges', 0)}{C.R}")
 
             if it.get('gaps'):
                 print(f"{C.L}Knowledge gaps:{C.R}")
@@ -332,11 +338,23 @@ class Synapse:
                 print(f"{C.L}Experiment plans:{C.R}")
                 for exp in it['experiments'][:2]:
                     if isinstance(exp, dict):
-                        print(f"  {C.W}{exp.get('experiment', '')[:140]}{C.R}")
+                        print(f"  {C.W}{exp.get('protocol_id', 'protocol')} | {exp.get('experiment', '')[:110]}{C.R}")
+                        if exp.get('objective'):
+                            print(f"    {C.D}Objective: {exp['objective'][:110]}{C.R}")
                         if exp.get('measurable_outcome'):
                             print(f"    {C.D}Metric: {exp['measurable_outcome'][:100]}{C.R}")
                         if exp.get('failure_signal'):
                             print(f"    {C.D}Failure signal: {exp['failure_signal'][:100]}{C.R}")
+                        if exp.get('analysis_plan'):
+                            print(f"    {C.D}Analysis: {exp['analysis_plan'][:100]}{C.R}")
+
+            if it.get('counterfactuals'):
+                print(f"{C.L}Counterfactual lab:{C.R}")
+                for cf in it['counterfactuals'][:1]:
+                    if isinstance(cf, dict):
+                        print(f"  {C.W}{cf.get('scenario', '')[:130]}{C.R}")
+                        print(f"    {C.D}Intervention: {cf.get('intervention', '')[:100]}{C.R}")
+                        print(f"    {C.D}Decision rule: {cf.get('decision_rule', '')[:100]}{C.R}")
 
             if it.get('feedback') and isinstance(it['feedback'], dict):
                 fb = it['feedback']
@@ -365,6 +383,15 @@ class Synapse:
                 f"{C.D}Dual vars: lambda={policy.get('final_dual_lambda', 0.0):.3f}, "
                 f"mu={policy.get('final_dual_mu', 0.0):.3f}{C.R}"
             )
+        if result.get('project_program'):
+            pp = result['project_program']
+            print(f"{C.D}Project stage: {pp.get('current_stage', 'n/a')} | milestones: {len(pp.get('milestones', []))}{C.R}")
+        if result.get('causal_graph'):
+            cg = result['causal_graph']
+            print(f"{C.D}Causal graph: nodes={len(cg.get('nodes', []))}, edges={len(cg.get('edges', []))}{C.R}")
+        if result.get('protocol_package'):
+            pkg = result['protocol_package']
+            print(f"{C.D}Protocol package: {len(pkg.get('protocols', []))} protocols | scenarios={pkg.get('counterfactual_scenarios', 0)}{C.R}")
 
         print(f"\n{C.D}Duration: {result.get('total_duration', 0):.1f}s | Saved to memory{C.R}\n")
 
@@ -389,6 +416,9 @@ class Synapse:
         print(f"  In-memory vectors: {stats.get('in_memory_vectors', 0)}")
         print(f"  Epistemic budgets: cost={stats.get('epistemic_cost_budget', 0.0):.2f}, risk={stats.get('epistemic_risk_budget', 0.0):.2f}")
         print(f"  Dual step: {stats.get('epistemic_dual_step', 0.0):.3f}")
+        print(f"  Falsification weight: {stats.get('falsification_weight', 0.0):.2f}")
+        print(f"  Project horizon: {stats.get('project_horizon', 0)}")
+        print(f"  Counterfactual branches: {stats.get('counterfactual_branches', 0)}")
         print(f"  Conversations: {stats['conversation_length']}")
 
         if stats['profiles']:
@@ -406,6 +436,9 @@ class Synapse:
         print(f"  FAISS vectors: {checks.get('faiss_vectors', 0)}")
         print(f"  In-memory vectors: {checks.get('in_memory_vectors', 0)}")
         print(f"  Run log dir writable: {'Yes' if checks.get('run_log_writable') else 'No'}")
+        print(f"  Falsification weight: {checks.get('falsification_weight', 0.0):.2f}")
+        print(f"  Project horizon: {checks.get('project_horizon', 0)}")
+        print(f"  Counterfactual branches: {checks.get('counterfactual_branches', 0)}")
         if checks.get('errors'):
             print(f"{C.D}Errors:{C.R}")
             for err in checks['errors']:

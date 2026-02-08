@@ -2,7 +2,7 @@
 Synapse Brain - Memory-Driven Scientific Thinking
 
 Architecture:
-- Semantic retrieval: Gemini text-embedding-004 (768D) + cosine similarity
+- Semantic retrieval: Gemini gemini-embedding-001 (configurable dimensionality) + cosine similarity
 - Keyword retrieval: BM25 (k1=1.5, b=0.75)
 - Hybrid fusion: RRF (k=60) over 4 signals: embedding + BM25 + importance + recency
 - Agentic retrieval: LLM judges sufficiency → generates refined queries → re-retrieve
@@ -87,6 +87,9 @@ SYNAPSE_EPISTEMIC_STOP_ENTROPY = float(os.getenv("SYNAPSE_EPISTEMIC_STOP_ENTROPY
 SYNAPSE_EPISTEMIC_COST_BUDGET = float(os.getenv("SYNAPSE_EPISTEMIC_COST_BUDGET", "0.28"))
 SYNAPSE_EPISTEMIC_RISK_BUDGET = float(os.getenv("SYNAPSE_EPISTEMIC_RISK_BUDGET", "0.12"))
 SYNAPSE_EPISTEMIC_DUAL_STEP = float(os.getenv("SYNAPSE_EPISTEMIC_DUAL_STEP", "0.08"))
+SYNAPSE_FALSIFICATION_WEIGHT = float(os.getenv("SYNAPSE_FALSIFICATION_WEIGHT", "0.68"))
+SYNAPSE_PROJECT_HORIZON = int(os.getenv("SYNAPSE_PROJECT_HORIZON", "3"))
+SYNAPSE_COUNTERFACTUAL_BRANCHES = int(os.getenv("SYNAPSE_COUNTERFACTUAL_BRANCHES", "3"))
 LLM_REQUIRED_ERROR = (
     "LLM is required but unavailable. Please install dependencies and set "
     "GEMINI_API_KEY in .env."
@@ -2304,6 +2307,9 @@ class ScientificExplorer:
         self.cost_budget = max(0.01, SYNAPSE_EPISTEMIC_COST_BUDGET)
         self.risk_budget = max(0.01, SYNAPSE_EPISTEMIC_RISK_BUDGET)
         self.dual_step = max(0.001, SYNAPSE_EPISTEMIC_DUAL_STEP)
+        self.falsification_weight = self._clip(SYNAPSE_FALSIFICATION_WEIGHT, 0.0, 1.0)
+        self.project_horizon = max(1, SYNAPSE_PROJECT_HORIZON)
+        self.counterfactual_branches = max(2, SYNAPSE_COUNTERFACTUAL_BRANCHES)
 
     def explore(self, topic: str, depth: int = 3,
                 status_callback: Callable = None) -> Dict[str, Any]:
@@ -2406,11 +2412,13 @@ class ScientificExplorer:
                 'cost_budget': self.cost_budget,
                 'risk_budget': self.risk_budget,
                 'dual_step': self.dual_step,
+                'falsification_weight': self.falsification_weight,
                 'stop_entropy': self.stop_entropy,
                 'assumptions': [
                     'bounded per-step gain/cost/risk proxies',
                     'bounded evidence deltas in log-odds update',
-                    'projected dual ascent for lambda/mu'
+                    'projected dual ascent for lambda/mu',
+                    'falsification-first prioritization over project horizon'
                 ],
                 'tool_trace': [],
                 'total_information_gain': 0.0,
@@ -2430,8 +2438,16 @@ class ScientificExplorer:
             entropy_before = self._belief_entropy(state['hypotheses'])
             prior_probs = self._belief_distribution(state['hypotheses'])
             action, expected = self._select_epistemic_tool(state, step, max_steps)
+            state['action_history'].append(action)
             ir = self._execute_epistemic_tool(
                 action=action, topic=topic, state=state, step=step + 1, total=max_steps
+            )
+            counterfactual_report = self._run_counterfactual_lab(
+                topic=topic, state=state, step=step + 1, selected_tool=action
+            )
+            graph_report = self._update_causal_graph(topic=topic, state=state, step=step + 1)
+            project_update = self._advance_project_program(
+                topic=topic, state=state, step=step + 1, max_steps=max_steps
             )
             self._normalize_hypothesis_beliefs(state['hypotheses'])
             entropy_after = self._belief_entropy(state['hypotheses'])
@@ -2465,6 +2481,10 @@ class ScientificExplorer:
             ir['realized_information_gain'] = realized_gain
             ir['realized_kl_gain'] = realized_kl_gain
             ir['belief_snapshot'] = self._rank_state_hypotheses(state['hypotheses'])[:3]
+            ir['counterfactuals'] = counterfactual_report.get('scenarios', [])
+            ir['counterfactual_summary'] = counterfactual_report.get('summary')
+            ir['causal_graph_delta'] = graph_report
+            ir['project_update'] = project_update
 
             if realized_gain < 0.01 and realized_kl_gain < 0.01:
                 no_gain_steps += 1
@@ -2485,6 +2505,8 @@ class ScientificExplorer:
                 'observed_risk': observed_risk,
                 'dual_lambda': state['dual_lambda'],
                 'dual_mu': state['dual_mu'],
+                'counterfactuals': len(ir['counterfactuals']),
+                'causal_edges': len(state.get('causal_graph', {}).get('edges', [])),
                 'reason': expected['reason'],
             })
 
@@ -2502,6 +2524,15 @@ class ScientificExplorer:
         result['epistemic_policy']['experiments_generated'] = len(state['experiments'])
         result['epistemic_policy']['final_dual_lambda'] = state.get('dual_lambda', self.lambda_cost)
         result['epistemic_policy']['final_dual_mu'] = state.get('dual_mu', self.mu_risk)
+        result['project_program'] = state.get('project_state', {})
+        result['counterfactual_lab'] = {
+            'scenario_count': len(state.get('counterfactuals', [])),
+            'top_scenarios': state.get('counterfactuals', [])[:5]
+        }
+        result['causal_graph'] = state.get('causal_graph', {'nodes': [], 'edges': []})
+        result['protocol_package'] = self._build_protocol_package(
+            topic=topic, state=state, iterations=result['iterations']
+        )
 
         if status_callback:
             status_callback("Writing final synthesis")
@@ -2548,6 +2579,58 @@ class ScientificExplorer:
                     }
                 )
 
+        project_state = result.get('project_program') or {}
+        if project_state:
+            self.memory._store_memcell(
+                content=f"[Project Program] {json.dumps(project_state, ensure_ascii=True)[:1800]}",
+                memory_type=MemoryType.FORESIGHT,
+                evidence=[Evidence(
+                    content=f"Long-horizon project state for {topic}",
+                    source="epistemic_exploration", type="inferred", confidence=0.72)],
+                importance=0.78,
+                metadata={
+                    'lifecycle': 'project_program',
+                    'topic': topic,
+                    'mode': 'epistemic_tools',
+                    'stage': project_state.get('current_stage', 'unknown')
+                }
+            )
+
+        causal_graph = result.get('causal_graph') or {}
+        if causal_graph.get('edges'):
+            self.memory._store_memcell(
+                content=f"[Causal Graph] nodes={len(causal_graph.get('nodes', []))}, edges={len(causal_graph.get('edges', []))}",
+                memory_type=MemoryType.FORESIGHT,
+                evidence=[Evidence(
+                    content=json.dumps(causal_graph, ensure_ascii=True)[:2000],
+                    source="epistemic_exploration", type="inferred", confidence=0.7)],
+                importance=0.74,
+                metadata={
+                    'lifecycle': 'causal_graph',
+                    'topic': topic,
+                    'mode': 'epistemic_tools',
+                    'nodes': len(causal_graph.get('nodes', [])),
+                    'edges': len(causal_graph.get('edges', []))
+                }
+            )
+
+        protocol_package = result.get('protocol_package') or {}
+        if protocol_package.get('protocols'):
+            self.memory._store_memcell(
+                content=f"[Protocol Package] {json.dumps(protocol_package, ensure_ascii=True)[:1800]}",
+                memory_type=MemoryType.FORESIGHT,
+                evidence=[Evidence(
+                    content=f"Protocol-grade experimental package for {topic}",
+                    source="epistemic_exploration", type="inferred", confidence=0.76)],
+                importance=0.8,
+                metadata={
+                    'lifecycle': 'protocol_package',
+                    'topic': topic,
+                    'mode': 'epistemic_tools',
+                    'protocol_count': len(protocol_package.get('protocols', []))
+                }
+            )
+
         self.memory._store_memcell(
             content=result['final_synthesis'] or f"Epistemic exploration of {topic} completed",
             memory_type=MemoryType.EPISODE,
@@ -2561,7 +2644,9 @@ class ScientificExplorer:
                 'mode': 'epistemic_tools',
                 'total_information_gain': result['epistemic_policy']['total_information_gain'],
                 'final_entropy': result['epistemic_policy']['final_entropy'],
-                'stop_reason': result['epistemic_policy']['stop_reason']
+                'stop_reason': result['epistemic_policy']['stop_reason'],
+                'causal_edges': len((result.get('causal_graph') or {}).get('edges', [])),
+                'protocols': len((result.get('protocol_package') or {}).get('protocols', []))
             }
         )
         return result
@@ -2619,12 +2704,18 @@ Return ONLY JSON array."""
             })
 
         self._normalize_hypothesis_beliefs(hypotheses)
+        project_state = self._bootstrap_project_program(topic, hypotheses, knowledge)
+        causal_graph = self._bootstrap_causal_graph(topic, hypotheses, knowledge)
 
         return {
             'hypotheses': hypotheses,
             'retrieved': retrieved,
             'knowledge': knowledge,
             'experiments': [],
+            'counterfactuals': [],
+            'protocols': [],
+            'project_state': project_state,
+            'causal_graph': causal_graph,
             'action_history': [],
             'total_information_gain': 0.0,
             'total_kl_gain': 0.0,
@@ -2661,28 +2752,35 @@ Return ONLY JSON array."""
         else:
             avg_uncertainty = 0.8
         max_belief = max([h.get('belief', 0.5) for h in hypotheses], default=0.5)
+        max_falsifiability = max([_safe_float(h.get('falsifiability_score', h.get('testability_score', 0.5)), 0.5)
+                                  for h in hypotheses], default=0.5)
         num_experiments = len(state.get('experiments', []))
         progress = (step + 1) / max(max_steps, 1)
+        project_progress = self._safe_project_progress(state.get('project_state'))
 
         if action == "retrieve_evidence":
             expected_gain = 0.25 + 0.45 * avg_uncertainty + 0.20 * entropy
+            expected_gain += 0.08 * (1.0 - project_progress)
             cost = 0.35
             risk = 0.10
             reason = "Evidence retrieval lowers epistemic uncertainty and supports posterior updates."
         elif action == "propose_hypotheses":
             expected_gain = 0.40 if len(hypotheses) < 4 else 0.18
             expected_gain += 0.20 * entropy
+            expected_gain += 0.10 * (1.0 - max_falsifiability)
             cost = 0.28
             risk = 0.22
             reason = "Hypothesis expansion increases search breadth when belief mass is diffuse."
         elif action == "audit_contradictions":
             expected_gain = 0.20 + 0.35 * max_belief + 0.15 * avg_uncertainty
+            expected_gain += 0.10 * max_falsifiability
             cost = 0.30
             risk = 0.08
             reason = "Contradiction audits prevent overconfident belief collapse."
         elif action == "design_experiments":
             expected_gain = 0.08 + 0.20 * (1.0 - entropy) + (0.15 if num_experiments == 0 else 0.05)
             expected_gain += 0.10 * progress
+            expected_gain += 0.15 * max_falsifiability
             cost = 0.20
             risk = 0.05
             reason = "Experiment design converts uncertain beliefs into testable next actions."
@@ -2883,8 +2981,10 @@ Return ONLY JSON."""
                                  step: int, total: int) -> Dict[str, Any]:
         ranked = self._rank_state_hypotheses(state['hypotheses'])[:4]
         experiments = self._design_experiments(topic, ranked)
+        experiments = self._prioritize_experiments_falsification(experiments, ranked)
         if experiments:
             state['experiments'].extend(experiments[:3])
+            state['protocols'].extend(experiments[:3])
             for exp in experiments[:3]:
                 idx = self._find_hypothesis_index(state['hypotheses'], exp.get('hypothesis', ''))
                 if idx is not None:
@@ -2892,7 +2992,11 @@ Return ONLY JSON."""
                     h['uncertainty'] = self._clip(h.get('uncertainty', 0.5) - 0.05, 0.01, 0.99)
         insights = []
         if experiments:
-            insights = [f"Designed {len(experiments[:3])} minimum-viable experiments to maximize falsifiability."]
+            top = experiments[0]
+            insights = [
+                f"Designed {len(experiments[:3])} protocol-grade experiments with falsification-first ordering.",
+                f"Top protocol targets failure signal: {top.get('failure_signal', 'n/a')[:120]}"
+            ]
         observed_cost = self._clip(0.14 + 0.06 * len(experiments[:3]), 0.0, 1.0)
         observed_risk = self._clip(0.04 + (0.05 if not experiments else 0.02), 0.0, 1.0)
         return {
@@ -2953,12 +3057,23 @@ Return ONLY JSON array."""
             belief = self._clip(_safe_float(item.get('belief', 0.5), 0.5), 0.0, 1.0)
             uncertainty = self._clip(_safe_float(item.get('uncertainty', 0.5), 0.5), 0.0, 1.0)
             testability = self._clip(_safe_float(item.get('testability_score', 0.5), 0.5), 0.0, 1.0)
-            priority = belief * (1.0 - uncertainty) * (0.5 + 0.5 * testability)
+            falsifiability = self._clip(
+                _safe_float(item.get('falsifiability_score', testability), testability), 0.0, 1.0
+            )
+            novelty = self._clip(_safe_float(item.get('novelty_score', 0.5), 0.5), 0.0, 1.0)
+            confirmation_score = belief * (1.0 - uncertainty) * (0.5 + 0.5 * testability)
+            falsification_score = falsifiability * (0.4 + 0.6 * uncertainty)
+            priority = (
+                self.falsification_weight * falsification_score
+                + (1.0 - self.falsification_weight) * confirmation_score
+            ) * (0.7 + 0.3 * novelty)
             ranked.append({
                 **item,
                 'belief': belief,
                 'uncertainty': uncertainty,
                 'testability_score': testability,
+                'falsifiability_score': falsifiability,
+                'novelty_score': novelty,
                 'priority_score': priority,
                 'status': item.get('status', 'ranked')
             })
@@ -3002,6 +3117,10 @@ Return ONLY JSON array."""
             'belief': self._clip(_safe_float(item.get('prior_belief', item.get('belief', 0.45)), 0.45), 0.0, 1.0),
             'uncertainty': self._clip(_safe_float(item.get('uncertainty', 0.65), 0.65), 0.0, 1.0),
             'testability_score': self._clip(_safe_float(item.get('testability_score', 0.5), 0.5), 0.0, 1.0),
+            'falsifiability_score': self._clip(
+                _safe_float(item.get('falsifiability_score', item.get('testability_score', 0.5)), 0.5), 0.0, 1.0
+            ),
+            'novelty_score': self._clip(_safe_float(item.get('novelty_score', 0.5), 0.5), 0.0, 1.0),
             'status': item.get('status', 'active')
         }
         hypotheses.append(entry)
@@ -3092,9 +3211,606 @@ Return ONLY JSON array."""
     def _clip(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
 
+    def _safe_project_progress(self, project_state: Optional[Dict[str, Any]]) -> float:
+        if not project_state:
+            return 0.0
+        milestones = project_state.get('milestones', [])
+        if not isinstance(milestones, list) or not milestones:
+            return 0.0
+        completed = 0
+        for ms in milestones:
+            if not isinstance(ms, dict):
+                continue
+            status = str(ms.get('status', '')).strip().lower()
+            if status in {'done', 'completed', 'validated'}:
+                completed += 1
+        return self._clip(completed / max(len(milestones), 1), 0.0, 1.0)
+
+    def _default_project_program(self, topic: str, hypotheses: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ranked = self._rank_state_hypotheses(hypotheses)[:3]
+        milestones = []
+        for idx, hyp in enumerate(ranked, start=1):
+            hypothesis_text = str(hyp.get('hypothesis', '')).strip()[:160]
+            milestones.append({
+                'id': f"ms_{idx}",
+                'name': f"Falsify/validate H{idx}",
+                'success_criteria': f"Obtain decisive metric for: {hypothesis_text}",
+                'status': 'pending',
+                'blocking_risk': "insufficient measurement specificity",
+                'next_action': "design protocol with explicit failure signal",
+                'horizon_step': min(self.project_horizon, idx),
+            })
+        if not milestones:
+            milestones.append({
+                'id': "ms_1",
+                'name': "Define first falsifiable mechanism",
+                'success_criteria': f"Convert {topic} into one measurable causal claim",
+                'status': 'pending',
+                'blocking_risk': "under-specified variables",
+                'next_action': "retrieve evidence and define variables",
+                'horizon_step': 1,
+            })
+        return {
+            'north_star_question': f"What mechanism best explains {topic} and survives falsification tests?",
+            'current_stage': 'scoping',
+            'milestones': milestones[: max(2, self.project_horizon)],
+            'decision_log': [],
+            'next_cycle_actions': [milestones[0]['next_action']],
+        }
+
+    def _bootstrap_project_program(self, topic: str, hypotheses: List[Dict[str, Any]],
+                                   knowledge: str) -> Dict[str, Any]:
+        fallback = self._default_project_program(topic, hypotheses)
+        prompt = f"""Initialize a long-horizon scientific project program for topic "{topic}".
+Prioritize falsification-first execution and measurable milestones.
+
+Hypotheses:
+{json.dumps(self._rank_state_hypotheses(hypotheses)[:4], ensure_ascii=True)}
+
+Evidence snapshot:
+{knowledge[:1600] if knowledge else "No evidence yet."}
+
+Return JSON:
+{{
+  "north_star_question":"...",
+  "current_stage":"scoping/discovery/validation",
+  "milestones":[
+    {{
+      "id":"ms_1",
+      "name":"...",
+      "success_criteria":"...",
+      "status":"pending/in_progress/done",
+      "blocking_risk":"...",
+      "next_action":"...",
+      "horizon_step":1
+    }}
+  ],
+  "next_cycle_actions":["..."]
+}}
+Return ONLY JSON."""
+        response = self.llm.generate(prompt)
+        if not response:
+            return fallback
+        parsed = _extract_first_json(response, dict)
+        if not isinstance(parsed, dict):
+            return fallback
+        milestones = parsed.get('milestones', [])
+        if not isinstance(milestones, list) or not milestones:
+            return fallback
+        cleaned = []
+        for idx, ms in enumerate(milestones[: max(2, self.project_horizon + 1)], start=1):
+            if not isinstance(ms, dict):
+                continue
+            cleaned.append({
+                'id': str(ms.get('id', f"ms_{idx}"))[:32],
+                'name': str(ms.get('name', f"Milestone {idx}"))[:140],
+                'success_criteria': str(ms.get('success_criteria', 'define measurable success'))[:220],
+                'status': str(ms.get('status', 'pending')).strip().lower(),
+                'blocking_risk': str(ms.get('blocking_risk', 'unknown risk'))[:180],
+                'next_action': str(ms.get('next_action', 'refine protocol'))[:180],
+                'horizon_step': max(1, min(self.project_horizon + 2, int(_safe_float(ms.get('horizon_step', idx), idx)))),
+            })
+        if not cleaned:
+            return fallback
+        return {
+            'north_star_question': str(
+                parsed.get('north_star_question', fallback['north_star_question'])
+            )[:220],
+            'current_stage': str(parsed.get('current_stage', fallback['current_stage'])).strip().lower(),
+            'milestones': cleaned,
+            'decision_log': [],
+            'next_cycle_actions': [
+                str(x)[:180] for x in parsed.get('next_cycle_actions', []) if isinstance(x, str)
+            ][:5] or fallback['next_cycle_actions'],
+        }
+
+    def _advance_project_program(self, topic: str, state: Dict[str, Any],
+                                 step: int, max_steps: int) -> Dict[str, Any]:
+        project = state.get('project_state') or self._default_project_program(topic, state.get('hypotheses', []))
+        ranked = self._rank_state_hypotheses(state.get('hypotheses', []))[:3]
+        experiments = state.get('experiments', [])[-3:]
+        counterfactuals = state.get('counterfactuals', [])[-2:]
+        prompt = f"""Update project program after step {step}/{max_steps} for "{topic}".
+Keep falsification-first planning. Mark milestone as done only if decisive evidence exists.
+
+Current project:
+{json.dumps(project, ensure_ascii=True)}
+
+Top hypotheses:
+{json.dumps(ranked, ensure_ascii=True)}
+
+Recent experiments:
+{json.dumps(experiments, ensure_ascii=True)}
+
+Recent counterfactuals:
+{json.dumps(counterfactuals, ensure_ascii=True)}
+
+Return JSON:
+{{
+  "current_stage":"scoping/discovery/validation",
+  "milestones":[{{"id":"ms_1","status":"pending/in_progress/done","next_action":"...","blocking_risk":"..."}}],
+  "next_cycle_actions":["..."],
+  "decision_note":"one concise PI decision"
+}}
+Return ONLY JSON."""
+        updated = None
+        response = self.llm.generate(prompt)
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                updated = parsed
+        if isinstance(updated, dict):
+            current = str(updated.get('current_stage', project.get('current_stage', 'discovery'))).strip().lower()
+            next_actions = [str(x)[:180] for x in updated.get('next_cycle_actions', []) if isinstance(x, str)][:5]
+            incoming = updated.get('milestones', [])
+            status_map: Dict[str, Dict[str, str]] = {}
+            if isinstance(incoming, list):
+                for item in incoming:
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get('id', '')).strip()
+                    if not key:
+                        continue
+                    status_map[key] = {
+                        'status': str(item.get('status', 'pending')).strip().lower(),
+                        'next_action': str(item.get('next_action', '')).strip()[:180],
+                        'blocking_risk': str(item.get('blocking_risk', '')).strip()[:180],
+                    }
+            for ms in project.get('milestones', []):
+                if not isinstance(ms, dict):
+                    continue
+                record = status_map.get(ms.get('id', ''))
+                if not record:
+                    continue
+                if record.get('status'):
+                    ms['status'] = record['status']
+                if record.get('next_action'):
+                    ms['next_action'] = record['next_action']
+                if record.get('blocking_risk'):
+                    ms['blocking_risk'] = record['blocking_risk']
+            project['current_stage'] = current
+            if next_actions:
+                project['next_cycle_actions'] = next_actions
+            decision_note = str(updated.get('decision_note', '')).strip()
+        else:
+            experiment_count = len(state.get('experiments', []))
+            if experiment_count == 0:
+                project['current_stage'] = 'scoping'
+            elif experiment_count < 3:
+                project['current_stage'] = 'discovery'
+            else:
+                project['current_stage'] = 'validation'
+            for ms in project.get('milestones', []):
+                if not isinstance(ms, dict):
+                    continue
+                if ms.get('status') == 'pending':
+                    ms['status'] = 'in_progress'
+                    break
+            decision_note = "Heuristic project update due to parsing failure."
+
+        action = (state.get('action_history') or ['none'])[-1]
+        project.setdefault('decision_log', [])
+        project['decision_log'].append({
+            'step': step,
+            'action': action,
+            'note': decision_note[:220] if decision_note else "Updated project trajectory.",
+            'timestamp': datetime.now().isoformat(),
+        })
+        project['decision_log'] = project['decision_log'][-12:]
+        state['project_state'] = project
+        return {
+            'current_stage': project.get('current_stage'),
+            'next_cycle_actions': project.get('next_cycle_actions', [])[:3],
+            'project_progress': self._safe_project_progress(project),
+            'last_decision': project['decision_log'][-1],
+        }
+
+    def _run_counterfactual_lab(self, topic: str, state: Dict[str, Any],
+                                step: int, selected_tool: str) -> Dict[str, Any]:
+        ranked = self._rank_state_hypotheses(state.get('hypotheses', []))[:3]
+        if not ranked:
+            return {'summary': None, 'scenarios': []}
+        prompt = f"""Run a counterfactual lab for "{topic}" at step {step}.
+Propose interventions that discriminate between top hypotheses.
+
+Top hypotheses:
+{json.dumps(ranked, ensure_ascii=True)}
+
+Recent protocols:
+{json.dumps(state.get('experiments', [])[-3:], ensure_ascii=True)}
+
+Return JSON:
+{{
+  "summary":"...",
+  "scenarios":[
+    {{
+      "scenario":"...",
+      "intervention":"...",
+      "expected_outcome":"...",
+      "discriminates_between":["hypothesis A","hypothesis B"],
+      "measurement":"...",
+      "falsifies":"...",
+      "decision_rule":"if metric X then reject/keep"
+    }}
+  ]
+}}
+Return ONLY JSON."""
+        response = self.llm.generate(prompt)
+        scenarios: List[Dict[str, Any]] = []
+        summary = None
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                summary = str(parsed.get('summary', '')).strip()[:220] or None
+                raw_items = parsed.get('scenarios', [])
+                if isinstance(raw_items, list):
+                    for item in raw_items[: self.counterfactual_branches]:
+                        if not isinstance(item, dict):
+                            continue
+                        scenario_name = str(item.get('scenario', '')).strip()
+                        intervention = str(item.get('intervention', '')).strip()
+                        expected = str(item.get('expected_outcome', '')).strip()
+                        if not scenario_name or not intervention:
+                            continue
+                        hypotheses = [
+                            str(x)[:140] for x in item.get('discriminates_between', []) if isinstance(x, str)
+                        ][:2]
+                        scenarios.append({
+                            'step': step,
+                            'selected_tool': selected_tool,
+                            'scenario': scenario_name[:140],
+                            'intervention': intervention[:200],
+                            'expected_outcome': expected[:220],
+                            'discriminates_between': hypotheses,
+                            'measurement': str(item.get('measurement', '')).strip()[:180],
+                            'falsifies': str(item.get('falsifies', '')).strip()[:180],
+                            'decision_rule': str(item.get('decision_rule', '')).strip()[:200],
+                        })
+        if not scenarios and ranked:
+            top = ranked[0]
+            scenarios = [{
+                'step': step,
+                'selected_tool': selected_tool,
+                'scenario': f"Perturb key driver for {top.get('id', 'hypothesis')}",
+                'intervention': f"Manipulate variable linked to: {top.get('hypothesis', '')[:120]}",
+                'expected_outcome': "Observe directional change in primary endpoint.",
+                'discriminates_between': [h.get('hypothesis', '')[:140] for h in ranked[:2]],
+                'measurement': "Primary quantitative endpoint with pre/post comparison.",
+                'falsifies': f"No directional change would challenge {top.get('hypothesis', '')[:120]}",
+                'decision_rule': "Reject if effect size remains near zero under intervention.",
+            }]
+            if not summary:
+                summary = "Generated heuristic counterfactual due to sparse model output."
+
+        existing = state.get('counterfactuals', [])
+        existing_keys = {
+            (str(s.get('scenario', '')).lower(), str(s.get('intervention', '')).lower())
+            for s in existing if isinstance(s, dict)
+        }
+        added = []
+        for item in scenarios:
+            key = (item['scenario'].lower(), item['intervention'].lower())
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            added.append(item)
+        if added:
+            state['counterfactuals'].extend(added)
+            state['counterfactuals'] = state['counterfactuals'][-20:]
+        return {'summary': summary, 'scenarios': added}
+
+    def _bootstrap_causal_graph(self, topic: str, hypotheses: List[Dict[str, Any]],
+                                knowledge: str) -> Dict[str, Any]:
+        prompt = f"""Create an initial causal graph for "{topic}" from hypotheses.
+
+Hypotheses:
+{json.dumps(self._rank_state_hypotheses(hypotheses)[:4], ensure_ascii=True)}
+
+Evidence snapshot:
+{knowledge[:1200] if knowledge else "No evidence available."}
+
+Return JSON:
+{{
+  "nodes":[{{"id":"n_driver","label":"...", "type":"driver/outcome/mediator/intervention"}}],
+  "edges":[{{"source":"n_driver","target":"n_outcome","relation":"increases/decreases/modulates","confidence":0.0,"status":"hypothesized","evidence":"..."}}],
+  "frontier_questions":["..."]
+}}
+Return ONLY JSON."""
+        response = self.llm.generate(prompt)
+        graph = {'nodes': [], 'edges': [], 'frontier_questions': [], 'last_updated_step': 0}
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                graph = self._merge_causal_graph(graph, parsed)
+        if not graph.get('nodes'):
+            topic_node = {'id': 'n_topic', 'label': topic[:80], 'type': 'outcome'}
+            graph['nodes'] = [topic_node]
+        return graph
+
+    def _update_causal_graph(self, topic: str, state: Dict[str, Any], step: int) -> Dict[str, Any]:
+        current = state.get('causal_graph') or {'nodes': [], 'edges': [], 'frontier_questions': []}
+        ranked = self._rank_state_hypotheses(state.get('hypotheses', []))[:3]
+        prompt = f"""Update causal graph for topic "{topic}" at step {step}.
+Add only high-value nodes/edges that improve experiment discrimination.
+
+Current graph:
+{json.dumps(current, ensure_ascii=True)}
+
+Top hypotheses:
+{json.dumps(ranked, ensure_ascii=True)}
+
+Recent experiments:
+{json.dumps(state.get('experiments', [])[-2:], ensure_ascii=True)}
+
+Return JSON:
+{{
+  "nodes":[{{"id":"n_x","label":"...", "type":"driver/outcome/mediator/intervention"}}],
+  "edges":[{{"source":"n_x","target":"n_y","relation":"increases/decreases/modulates","confidence":0.0,"status":"hypothesized/supported/contested","evidence":"..."}}],
+  "frontier_questions":["..."]
+}}
+Return ONLY JSON."""
+        response = self.llm.generate(prompt)
+        before_nodes = len(current.get('nodes', []))
+        before_edges = len(current.get('edges', []))
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                current = self._merge_causal_graph(current, parsed)
+        current['last_updated_step'] = step
+        state['causal_graph'] = current
+        return {
+            'nodes_added': max(0, len(current.get('nodes', [])) - before_nodes),
+            'edges_added': max(0, len(current.get('edges', [])) - before_edges),
+            'total_nodes': len(current.get('nodes', [])),
+            'total_edges': len(current.get('edges', [])),
+        }
+
+    def _merge_causal_graph(self, base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+        merged = {
+            'nodes': list(base.get('nodes', [])),
+            'edges': list(base.get('edges', [])),
+            'frontier_questions': list(base.get('frontier_questions', [])),
+            'last_updated_step': base.get('last_updated_step', 0),
+        }
+
+        node_map = {}
+        for node in merged['nodes']:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get('id', '')).strip()
+            label = str(node.get('label', '')).strip().lower()
+            if node_id:
+                node_map[node_id] = node
+            if label:
+                node_map[label] = node
+
+        for node in update.get('nodes', []):
+            if not isinstance(node, dict):
+                continue
+            label = str(node.get('label', '')).strip()
+            node_id = str(node.get('id', '')).strip() or f"n_{hashlib.md5(label.lower().encode()).hexdigest()[:8]}"
+            if not label:
+                continue
+            existing = node_map.get(node_id) or node_map.get(label.lower())
+            if existing:
+                existing['type'] = str(node.get('type', existing.get('type', 'factor'))).strip().lower()[:24]
+                continue
+            entry = {'id': node_id, 'label': label[:120], 'type': str(node.get('type', 'factor')).strip().lower()[:24]}
+            merged['nodes'].append(entry)
+            node_map[node_id] = entry
+            node_map[label.lower()] = entry
+
+        edge_keys = {
+            (
+                str(e.get('source', '')).strip().lower(),
+                str(e.get('target', '')).strip().lower(),
+                str(e.get('relation', '')).strip().lower(),
+            )
+            for e in merged['edges'] if isinstance(e, dict)
+        }
+        for edge in update.get('edges', []):
+            if not isinstance(edge, dict):
+                continue
+            source = str(edge.get('source', '')).strip()
+            target = str(edge.get('target', '')).strip()
+            relation = str(edge.get('relation', 'modulates')).strip().lower()
+            if not source or not target:
+                continue
+            key = (source.lower(), target.lower(), relation)
+            if key in edge_keys:
+                continue
+            edge_keys.add(key)
+            merged['edges'].append({
+                'source': source[:64],
+                'target': target[:64],
+                'relation': relation[:32],
+                'confidence': self._clip(_safe_float(edge.get('confidence', 0.5), 0.5), 0.0, 1.0),
+                'status': str(edge.get('status', 'hypothesized')).strip().lower()[:32],
+                'evidence': str(edge.get('evidence', '')).strip()[:220],
+            })
+
+        frontier = merged['frontier_questions']
+        for q in update.get('frontier_questions', []):
+            if not isinstance(q, str):
+                continue
+            text = q.strip()
+            if not text:
+                continue
+            if text.lower() in {x.lower() for x in frontier}:
+                continue
+            frontier.append(text[:180])
+            if len(frontier) >= 8:
+                break
+        merged['frontier_questions'] = frontier[:8]
+        return merged
+
+    def _normalize_protocol_experiment(self, item: Dict[str, Any],
+                                       fallback_hypothesis: str = "",
+                                       rank: int = 1) -> Dict[str, Any]:
+        hypothesis = str(item.get('hypothesis', fallback_hypothesis)).strip()
+        experiment = str(item.get('experiment', '')).strip()
+        measurable_outcome = str(item.get('measurable_outcome', '')).strip()
+        failure_signal = str(item.get('failure_signal', '')).strip()
+        if not measurable_outcome:
+            measurable_outcome = "Primary endpoint with predefined threshold."
+        if not failure_signal:
+            failure_signal = "Observed endpoint fails to move in predicted direction."
+        variables = item.get('variables', {})
+        if not isinstance(variables, dict):
+            variables = {}
+        independent = variables.get('independent', item.get('independent_variable', 'intervention intensity'))
+        dependent = variables.get('dependent', item.get('dependent_variable', measurable_outcome))
+        controls = variables.get('controls', item.get('controls', ['matched baseline condition']))
+        if not isinstance(controls, list):
+            controls = [str(controls)]
+        protocol_id = str(item.get('protocol_id', '')).strip()
+        if not protocol_id:
+            seed = f"{hypothesis}|{experiment}|{rank}"
+            protocol_id = f"prot_{hashlib.md5(seed.encode()).hexdigest()[:10]}"
+        return {
+            'protocol_id': protocol_id,
+            'hypothesis': hypothesis[:200],
+            'objective': str(item.get('objective', f"Discriminate and attempt to falsify: {hypothesis[:120]}")).strip()[:220],
+            'null_hypothesis': str(
+                item.get('null_hypothesis', f"No measurable effect for: {hypothesis[:120]}")
+            ).strip()[:220],
+            'experiment': experiment[:320],
+            'design_type': str(item.get('design_type', 'controlled intervention')).strip()[:80],
+            'variables': {
+                'independent': str(independent)[:160],
+                'dependent': str(dependent)[:160],
+                'controls': [str(c)[:140] for c in controls[:4] if str(c).strip()],
+            },
+            'inclusion_criteria': str(item.get('inclusion_criteria', 'Pre-registered inclusion criteria and calibrated instrumentation.')).strip()[:220],
+            'exclusion_criteria': str(item.get('exclusion_criteria', 'Exclude runs with protocol deviations above tolerance.')).strip()[:220],
+            'sample_size_rationale': str(item.get('sample_size_rationale', 'Power analysis targeting 80% power for minimal effect size.')).strip()[:220],
+            'measurement_plan': str(item.get('measurement_plan', measurable_outcome)).strip()[:260],
+            'analysis_plan': str(item.get('analysis_plan', 'Pre-registered primary test plus robustness checks.')).strip()[:220],
+            'confound_mitigation': str(item.get('confound_mitigation', 'Randomization, blinding when feasible, and covariate adjustment.')).strip()[:220],
+            'stopping_rule': str(item.get('stopping_rule', 'Stop when planned sample size is reached or safety threshold is crossed.')).strip()[:220],
+            'measurable_outcome': measurable_outcome[:200],
+            'failure_signal': failure_signal[:220],
+            'resources': str(item.get('resources', 'Minimal bench setup + measurement tooling')).strip()[:200],
+            'estimated_duration': str(item.get('estimated_duration', '1-2 weeks')).strip()[:80],
+            'falsification_strength': self._clip(_safe_float(item.get('falsification_strength', 0.6), 0.6), 0.0, 1.0),
+            'priority_score': self._clip(_safe_float(item.get('priority_score', 0.5), 0.5), 0.0, 1.0),
+            'status': str(item.get('status', 'experiment_designed')).strip().lower()[:40],
+        }
+
+    def _prioritize_experiments_falsification(self, experiments: List[Dict[str, Any]],
+                                              ranked_hypotheses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not experiments:
+            return []
+        hypothesis_fals: Dict[str, float] = {}
+        for h in ranked_hypotheses:
+            if not isinstance(h, dict):
+                continue
+            hypothesis_fals[str(h.get('hypothesis', '')).lower()] = self._clip(
+                _safe_float(h.get('falsifiability_score', h.get('testability_score', 0.5)), 0.5), 0.0, 1.0
+            )
+
+        normalized = []
+        for idx, exp in enumerate(experiments, start=1):
+            if not isinstance(exp, dict):
+                continue
+            item = self._normalize_protocol_experiment(exp, rank=idx)
+            key = str(item.get('hypothesis', '')).lower()
+            hypothesis_score = hypothesis_fals.get(key, 0.5)
+            combined = (
+                self.falsification_weight * max(item.get('falsification_strength', 0.0), hypothesis_score)
+                + (1.0 - self.falsification_weight) * item.get('priority_score', 0.0)
+            )
+            item['falsification_priority'] = self._clip(combined, 0.0, 1.0)
+            normalized.append(item)
+
+        normalized.sort(key=lambda x: x.get('falsification_priority', 0.0), reverse=True)
+        for idx, exp in enumerate(normalized, start=1):
+            exp['execution_order'] = idx
+        return normalized
+
+    def _build_protocol_package(self, topic: str, state: Dict[str, Any],
+                                iterations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        raw = []
+        raw.extend([x for x in state.get('protocols', []) if isinstance(x, dict)])
+        raw.extend([x for x in state.get('experiments', []) if isinstance(x, dict)])
+        ranked = self._rank_state_hypotheses(state.get('hypotheses', []))[:5]
+        protocols = self._prioritize_experiments_falsification(raw, ranked)[:6]
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for item in protocols:
+            pid = item.get('protocol_id')
+            if pid in seen:
+                continue
+            seen.add(pid)
+            deduped.append(item)
+        quality_checks = [
+            "Each protocol contains explicit null hypothesis and failure signal.",
+            "Primary endpoint and analysis plan are pre-specified.",
+            "Confound mitigation and stopping rules are included."
+        ]
+        package = {
+            'topic': topic,
+            'generated_at': datetime.now().isoformat(),
+            'protocols': deduped,
+            'execution_sequence': [p.get('protocol_id') for p in deduped],
+            'quality_checks': quality_checks,
+            'project_stage': (state.get('project_state') or {}).get('current_stage', 'unknown'),
+            'causal_edges': len((state.get('causal_graph') or {}).get('edges', [])),
+            'counterfactual_scenarios': len(state.get('counterfactuals', [])),
+        }
+        if not deduped:
+            return package
+
+        prompt = f"""Write a concise protocol governance note for "{topic}".
+Use this protocol package:
+{json.dumps(package, ensure_ascii=True)}
+
+Return JSON:
+{{
+  "governance_note":"...",
+  "highest_risk_protocol":"protocol_id",
+  "risk_rationale":"...",
+  "next_review_trigger":"..."
+}}
+Return ONLY JSON."""
+        response = self.llm.generate(prompt)
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                package['governance_note'] = str(parsed.get('governance_note', '')).strip()[:260]
+                package['highest_risk_protocol'] = str(parsed.get('highest_risk_protocol', '')).strip()[:32]
+                package['risk_rationale'] = str(parsed.get('risk_rationale', '')).strip()[:220]
+                package['next_review_trigger'] = str(parsed.get('next_review_trigger', '')).strip()[:220]
+        if not package.get('governance_note'):
+            package['governance_note'] = "Prioritize top falsification protocols and review after first decisive failure signal."
+        return package
+
     def _synthesize_epistemic(self, topic: str, iterations: List[Dict[str, Any]],
                               state: Dict[str, Any]) -> Optional[str]:
         ranked = self._rank_state_hypotheses(state.get('hypotheses', []))[:5]
+        causal_graph = state.get('causal_graph', {})
+        project_state = state.get('project_state', {})
+        counterfactuals = state.get('counterfactuals', [])[:4]
         tool_trace = [
             {
                 'tool': it.get('selected_tool'),
@@ -3115,11 +3831,21 @@ Tool trajectory:
 Generated experiments:
 {json.dumps(state.get('experiments', [])[:5], ensure_ascii=True)}
 
-Write 4 concise paragraphs:
+Project program:
+{json.dumps(project_state, ensure_ascii=True)}
+
+Causal graph snapshot:
+{json.dumps(causal_graph, ensure_ascii=True)}
+
+Counterfactual scenarios:
+{json.dumps(counterfactuals, ensure_ascii=True)}
+
+Write 5 concise paragraphs:
 1) Posterior state of knowledge and remaining uncertainty
 2) Highest-priority hypotheses and confidence rationale
-3) Contradictions/risks that still threaten validity
-4) Next experimental actions with measurable outcomes
+3) Causal mechanism map and frontier unknowns
+4) Counterfactual discriminators and explicit falsification logic
+5) Next project actions with protocol-level measurable outcomes
 
 Write as a principal investigator preparing a lab decision memo."""
         synthesis = self.llm.generate(prompt)
@@ -3128,7 +3854,8 @@ Write as a principal investigator preparing a lab decision memo."""
         return (
             f"Epistemic exploration of {topic} completed. "
             f"Final entropy={self._belief_entropy(state.get('hypotheses', [])):.3f}. "
-            f"Generated {len(state.get('experiments', []))} experiments."
+            f"Generated {len(state.get('experiments', []))} experiments; "
+            f"causal edges={len(causal_graph.get('edges', []))}."
         )
 
     def _run_iteration(self, topic: str, iteration: int, total: int,
@@ -3295,7 +4022,31 @@ Return ONLY JSON array."""
                     })
                 cleaned.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
                 return cleaned[:4]
-        return []
+        fallback = []
+        for hyp in hypotheses[:4]:
+            if not isinstance(hyp, dict):
+                continue
+            testability = self._clip(_safe_float(hyp.get('testability_score', 0.55), 0.55), 0.0, 1.0)
+            falsifiability = self._clip(
+                _safe_float(hyp.get('falsifiability_score', testability), testability), 0.0, 1.0
+            )
+            novelty = self._clip(_safe_float(hyp.get('novelty_score', 0.5), 0.5), 0.0, 1.0)
+            belief = self._clip(_safe_float(hyp.get('belief', 0.5), 0.5), 0.0, 1.0)
+            uncertainty = self._clip(_safe_float(hyp.get('uncertainty', 0.5), 0.5), 0.0, 1.0)
+            priority = (
+                self.falsification_weight * falsifiability * (0.4 + 0.6 * uncertainty)
+                + (1.0 - self.falsification_weight) * belief * (0.5 + 0.5 * testability)
+            ) * (0.7 + 0.3 * novelty)
+            fallback.append({
+                'hypothesis': hyp.get('hypothesis', ''),
+                'testability_score': testability,
+                'novelty_score': novelty,
+                'falsifiability_score': falsifiability,
+                'priority_score': priority,
+                'status': 'ranked'
+            })
+        fallback.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
+        return fallback[:4]
 
     def _design_experiments(self, topic: str,
                             ranked_hypotheses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3303,19 +4054,33 @@ Return ONLY JSON array."""
             return []
         top = ranked_hypotheses[:3]
 
-        prompt = f"""Design minimum viable experiments for top-ranked hypotheses on "{topic}".
-Each experiment must include measurable outcome and failure signal.
+        prompt = f"""Design protocol-grade minimum viable experiments for top-ranked hypotheses on "{topic}".
+Each protocol must support falsification-first execution.
 
 Hypotheses:
 {json.dumps(top, ensure_ascii=True)}
 
 Return JSON array:
 [{{
+  "protocol_id":"prot_x",
   "hypothesis":"...",
+  "objective":"...",
+  "null_hypothesis":"...",
   "experiment":"stepwise minimal experiment design",
+  "design_type":"controlled intervention/observational cohort/etc",
+  "variables":{{"independent":"...","dependent":"...","controls":["..."]}},
+  "inclusion_criteria":"...",
+  "exclusion_criteria":"...",
+  "sample_size_rationale":"...",
+  "measurement_plan":"...",
+  "analysis_plan":"...",
+  "confound_mitigation":"...",
+  "stopping_rule":"...",
   "measurable_outcome":"quantitative metric",
   "failure_signal":"what falsifies the hypothesis",
   "resources":"minimal resources required",
+  "estimated_duration":"...",
+  "falsification_strength":0.0,
   "priority_score":0.0,
   "status":"experiment_designed"
 }}]
@@ -3325,19 +4090,29 @@ Return ONLY JSON array."""
             data = _extract_first_json(response, list)
             if isinstance(data, list):
                 experiments = []
-                for item in data:
+                for idx, item in enumerate(data, start=1):
                     if isinstance(item, dict):
-                        experiments.append({
-                            'hypothesis': item.get('hypothesis', ''),
-                            'experiment': item.get('experiment', ''),
-                            'measurable_outcome': item.get('measurable_outcome', ''),
-                            'failure_signal': item.get('failure_signal', ''),
-                            'resources': item.get('resources', ''),
-                            'priority_score': _safe_float(item.get('priority_score', 0.0)),
-                            'status': 'experiment_designed'
-                        })
+                        fallback_h = top[min(idx - 1, len(top) - 1)].get('hypothesis', '')
+                        normalized = self._normalize_protocol_experiment(
+                            item, fallback_hypothesis=fallback_h, rank=idx
+                        )
+                        experiments.append(normalized)
                 if experiments:
                     return experiments[:3]
+        # Deterministic fallback keeps pipeline alive when model output is sparse.
+        fallback = []
+        for idx, hyp in enumerate(top, start=1):
+            fallback.append(self._normalize_protocol_experiment({
+                'hypothesis': hyp.get('hypothesis', ''),
+                'objective': f"Falsify or support hypothesis {idx}",
+                'experiment': f"Controlled perturbation test for hypothesis {idx}",
+                'measurable_outcome': "Primary endpoint change with confidence interval",
+                'failure_signal': "No directional endpoint shift under intervention",
+                'falsification_strength': hyp.get('falsifiability_score', 0.6),
+                'priority_score': hyp.get('priority_score', 0.5),
+            }, fallback_hypothesis=hyp.get('hypothesis', ''), rank=idx))
+        if fallback:
+            return fallback[:3]
         return []
 
     def _synthesize(self, topic: str, iterations: List[Dict]) -> Optional[str]:
@@ -3517,6 +4292,10 @@ class SynapseBrain:
             "epistemic_final_dual_lambda": (result.get("epistemic_policy") or {}).get("final_dual_lambda"),
             "epistemic_final_dual_mu": (result.get("epistemic_policy") or {}).get("final_dual_mu"),
             "epistemic_stop_reason": (result.get("epistemic_policy") or {}).get("stop_reason"),
+            "project_stage": (result.get("project_program") or {}).get("current_stage"),
+            "causal_edges": len((result.get("causal_graph") or {}).get("edges", [])),
+            "counterfactual_scenarios": (result.get("counterfactual_lab") or {}).get("scenario_count", 0),
+            "protocol_count": len((result.get("protocol_package") or {}).get("protocols", [])),
             "error": result.get("error")
         })
         self._auto_save()
@@ -3551,6 +4330,9 @@ class SynapseBrain:
             'epistemic_cost_budget': self.explorer.cost_budget,
             'epistemic_risk_budget': self.explorer.risk_budget,
             'epistemic_dual_step': self.explorer.dual_step,
+            'falsification_weight': self.explorer.falsification_weight,
+            'project_horizon': self.explorer.project_horizon,
+            'counterfactual_branches': self.explorer.counterfactual_branches,
             'storage': (
                 'sqlite+faiss' if self.memory.db and has_faiss_backend
                 else 'sqlite+in-memory' if self.memory.db
@@ -3578,6 +4360,9 @@ class SynapseBrain:
             'epistemic_cost_budget': self.explorer.cost_budget,
             'epistemic_risk_budget': self.explorer.risk_budget,
             'epistemic_dual_step': self.explorer.dual_step,
+            'falsification_weight': self.explorer.falsification_weight,
+            'project_horizon': self.explorer.project_horizon,
+            'counterfactual_branches': self.explorer.counterfactual_branches,
             'vector_backend': 'faiss' if self.memory.faiss_vectors and self.memory.faiss_vectors.index is not None else 'in-memory',
             'faiss_vectors': self.memory.faiss_vectors.size if self.memory.faiss_vectors else 0,
             'in_memory_vectors': len(self.memory.vectors.embeddings),
