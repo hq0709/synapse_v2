@@ -298,6 +298,9 @@ class Synapse:
         for it in result['iterations']:
             n = it['iteration']
             print(f"\n{C.B}--- Iteration {n} ({it.get('duration', 0):.1f}s) ---{C.R}")
+            if it.get('selected_tool'):
+                print(f"{C.D}Tool: {it.get('selected_tool')} | expected IG={it.get('expected_information_gain', 0.0):.3f} | realized IG={it.get('realized_information_gain', 0.0):.3f}{C.R}")
+                print(f"{C.D}Entropy: {it.get('entropy_before', 0.0):.3f} -> {it.get('entropy_after', 0.0):.3f}{C.R}")
 
             if it.get('gaps'):
                 print(f"{C.L}Knowledge gaps:{C.R}")
@@ -350,6 +353,13 @@ class Synapse:
         if result.get('final_synthesis'):
             print(f"\n{C.B}{C.BOLD}Synthesis:{C.R}")
             print(result['final_synthesis'])
+
+        if result.get('epistemic_policy'):
+            policy = result['epistemic_policy']
+            print(
+                f"\n{C.D}Epistemic policy | total IG: {policy.get('total_information_gain', 0.0):.3f} | "
+                f"final entropy: {policy.get('final_entropy', 0.0):.3f} | stop: {policy.get('stop_reason', 'n/a')}{C.R}"
+            )
 
         print(f"\n{C.D}Duration: {result.get('total_duration', 0):.1f}s | Saved to memory{C.R}\n")
 

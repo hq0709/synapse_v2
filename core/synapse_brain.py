@@ -80,6 +80,10 @@ GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "768"))
 SYNAPSE_AUTO_BACKFILL_EMBEDDINGS = os.getenv(
     "SYNAPSE_AUTO_BACKFILL_EMBEDDINGS", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
+SYNAPSE_EXPLORER_MODE = os.getenv("SYNAPSE_EXPLORER_MODE", "epistemic_tools").strip().lower()
+SYNAPSE_EPISTEMIC_LAMBDA_COST = float(os.getenv("SYNAPSE_EPISTEMIC_LAMBDA_COST", "0.15"))
+SYNAPSE_EPISTEMIC_MU_RISK = float(os.getenv("SYNAPSE_EPISTEMIC_MU_RISK", "0.10"))
+SYNAPSE_EPISTEMIC_STOP_ENTROPY = float(os.getenv("SYNAPSE_EPISTEMIC_STOP_ENTROPY", "0.35"))
 LLM_REQUIRED_ERROR = (
     "LLM is required but unavailable. Please install dependencies and set "
     "GEMINI_API_KEY in .env."
@@ -2277,18 +2281,36 @@ Return JSON only:
 # ======================== Scientific Explorer ========================
 
 class ScientificExplorer:
-    """Deep exploration with evidence-chain hypotheses."""
+    """Deep exploration with evidence-chain hypotheses and epistemic tool policy."""
     EVIDENCE_TYPES = {MemoryType.ATOMIC_FACT, MemoryType.EPISODE}
+    TOOL_ACTIONS = (
+        "retrieve_evidence",
+        "propose_hypotheses",
+        "audit_contradictions",
+        "design_experiments",
+        "recalibrate_beliefs",
+    )
 
     def __init__(self, memory: MemorySystem, llm: LLMProvider):
         self.memory = memory
         self.llm = llm
+        self.mode = SYNAPSE_EXPLORER_MODE
+        self.lambda_cost = SYNAPSE_EPISTEMIC_LAMBDA_COST
+        self.mu_risk = SYNAPSE_EPISTEMIC_MU_RISK
+        self.stop_entropy = SYNAPSE_EPISTEMIC_STOP_ENTROPY
 
     def explore(self, topic: str, depth: int = 3,
                 status_callback: Callable = None) -> Dict[str, Any]:
+        if self.mode in {"legacy", "classic"}:
+            return self._explore_legacy(topic, depth, status_callback)
+        return self._explore_epistemic_tools(topic, depth, status_callback)
+
+    def _explore_legacy(self, topic: str, depth: int = 3,
+                        status_callback: Callable = None) -> Dict[str, Any]:
         result = {
             'topic': topic, 'start_time': datetime.now(),
-            'iterations': [], 'final_synthesis': None
+            'iterations': [], 'final_synthesis': None,
+            'mode': 'legacy'
         }
         accumulated = []
 
@@ -2359,6 +2381,624 @@ class ScientificExplorer:
             }
         )
         return result
+
+    def _explore_epistemic_tools(self, topic: str, depth: int = 3,
+                                 status_callback: Callable = None) -> Dict[str, Any]:
+        result = {
+            'topic': topic,
+            'start_time': datetime.now(),
+            'iterations': [],
+            'final_synthesis': None,
+            'mode': 'epistemic_tools',
+            'epistemic_policy': {
+                'objective': 'maximize(expected_information_gain - lambda_cost*cost - mu_risk*risk)',
+                'lambda_cost': self.lambda_cost,
+                'mu_risk': self.mu_risk,
+                'stop_entropy': self.stop_entropy,
+                'tool_trace': [],
+                'total_information_gain': 0.0,
+                'final_entropy': 1.0,
+                'stop_reason': 'budget_exhausted'
+            }
+        }
+        state = self._init_epistemic_state(topic, depth)
+        max_steps = max(4, depth * 4)
+        no_gain_steps = 0
+
+        for step in range(max_steps):
+            if status_callback:
+                status_callback(f"Epistemic policy {step+1}/{max_steps}")
+
+            entropy_before = self._belief_entropy(state['hypotheses'])
+            action, expected = self._select_epistemic_tool(state, step, max_steps)
+            ir = self._execute_epistemic_tool(
+                action=action, topic=topic, state=state, step=step + 1, total=max_steps
+            )
+            entropy_after = self._belief_entropy(state['hypotheses'])
+            realized_gain = max(0.0, entropy_before - entropy_after)
+            state['total_information_gain'] += realized_gain
+            ir['selected_tool'] = action
+            ir['expected_utility'] = expected['utility']
+            ir['expected_information_gain'] = expected['expected_information_gain']
+            ir['expected_cost'] = expected['cost']
+            ir['expected_risk'] = expected['risk']
+            ir['entropy_before'] = entropy_before
+            ir['entropy_after'] = entropy_after
+            ir['realized_information_gain'] = realized_gain
+            ir['belief_snapshot'] = self._rank_state_hypotheses(state['hypotheses'])[:3]
+
+            if realized_gain < 0.01:
+                no_gain_steps += 1
+            else:
+                no_gain_steps = 0
+
+            result['iterations'].append(ir)
+            result['epistemic_policy']['tool_trace'].append({
+                'step': step + 1,
+                'action': action,
+                'expected_utility': expected['utility'],
+                'expected_information_gain': expected['expected_information_gain'],
+                'realized_information_gain': realized_gain,
+                'entropy_before': entropy_before,
+                'entropy_after': entropy_after,
+                'reason': expected['reason'],
+            })
+
+            if entropy_after <= self.stop_entropy and len(state['experiments']) > 0:
+                result['epistemic_policy']['stop_reason'] = 'low_entropy_with_experiment_plan'
+                break
+            if no_gain_steps >= 2 and step + 1 >= max(3, depth):
+                result['epistemic_policy']['stop_reason'] = 'information_gain_plateau'
+                break
+
+        result['epistemic_policy']['total_information_gain'] = state['total_information_gain']
+        result['epistemic_policy']['final_entropy'] = self._belief_entropy(state['hypotheses'])
+        result['epistemic_policy']['final_hypotheses'] = self._rank_state_hypotheses(state['hypotheses'])[:5]
+        result['epistemic_policy']['experiments_generated'] = len(state['experiments'])
+
+        if status_callback:
+            status_callback("Writing final synthesis")
+        result['final_synthesis'] = self._synthesize_epistemic(topic, result['iterations'], state)
+        result['end_time'] = datetime.now()
+        result['total_duration'] = (result['end_time'] - result['start_time']).total_seconds()
+
+        for step_result in result['iterations']:
+            for insight in step_result.get('insights', [])[:3]:
+                self.memory._store_memcell(
+                    content=insight,
+                    memory_type=MemoryType.FORESIGHT,
+                    evidence=[Evidence(
+                        content=f"Epistemic tool policy exploration of {topic}",
+                        source="epistemic_exploration", type="inferred", confidence=0.65)],
+                    importance=0.72,
+                    metadata={
+                        'lifecycle': 'insight',
+                        'topic': topic,
+                        'mode': 'epistemic_tools',
+                        'tool': step_result.get('selected_tool')
+                    }
+                )
+            for exp in step_result.get('experiments', [])[:2]:
+                content = (
+                    f"[Epistemic Experiment Plan] {exp.get('hypothesis', '')}\n"
+                    f"Plan: {exp.get('experiment', '')}\n"
+                    f"Outcome metric: {exp.get('measurable_outcome', '')}"
+                ).strip()
+                self.memory._store_memcell(
+                    content=content,
+                    memory_type=MemoryType.FORESIGHT,
+                    evidence=[Evidence(
+                        content=f"Epistemic tool policy experiment plan for {topic}",
+                        source="epistemic_exploration", type="inferred", confidence=0.7)],
+                    importance=0.75,
+                    metadata={
+                        'lifecycle': 'experiment_plan',
+                        'topic': topic,
+                        'mode': 'epistemic_tools',
+                        'tool': step_result.get('selected_tool'),
+                        'priority_score': exp.get('priority_score', 0.0),
+                        'failure_signal': exp.get('failure_signal', '')
+                    }
+                )
+
+        self.memory._store_memcell(
+            content=result['final_synthesis'] or f"Epistemic exploration of {topic} completed",
+            memory_type=MemoryType.EPISODE,
+            evidence=[Evidence(
+                content=f"Epistemic synthesis for {topic} with stop reason {result['epistemic_policy']['stop_reason']}",
+                source="epistemic_exploration", type="inferred", confidence=0.75)],
+            importance=0.82,
+            metadata={
+                'lifecycle': 'synthesis',
+                'topic': topic,
+                'mode': 'epistemic_tools',
+                'total_information_gain': result['epistemic_policy']['total_information_gain'],
+                'final_entropy': result['epistemic_policy']['final_entropy'],
+                'stop_reason': result['epistemic_policy']['stop_reason']
+            }
+        )
+        return result
+
+    def _init_epistemic_state(self, topic: str, depth: int) -> Dict[str, Any]:
+        retrieved = self.memory.retrieve(
+            topic,
+            top_k=max(10, depth * 5),
+            strategy="agentic",
+            allowed_types=self.EVIDENCE_TYPES
+        )
+        knowledge = "\n".join([f"[{i}] {mem.content}" for i, (mem, _) in enumerate(retrieved[:12])])
+        hyp_prompt = f"""Initialize a hypothesis space for scientific exploration of "{topic}".
+Use the evidence to generate 3-5 candidate hypotheses.
+
+Evidence:
+{knowledge if knowledge else "No retrieved evidence. Use cautious priors."}
+
+Return JSON array:
+[{{"hypothesis":"...", "rationale":"...", "prior_belief":0.0, "uncertainty":0.0, "testability_score":0.0}}]
+Rules:
+- prior_belief in [0,1], uncertainty in [0,1]
+- uncertainty should be high when evidence is weak
+- hypotheses must be falsifiable
+Return ONLY JSON array."""
+        hypotheses: List[Dict[str, Any]] = []
+        response = self.llm.generate(hyp_prompt)
+        if response:
+            parsed = _extract_first_json(response, list)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    added = self._add_state_hypothesis(hypotheses, item)
+                    if not added:
+                        continue
+
+        if not hypotheses:
+            for i, (mem, _) in enumerate(retrieved[:3], start=1):
+                self._add_state_hypothesis(hypotheses, {
+                    "hypothesis": f"H{i}: {mem.content[:180]}",
+                    "rationale": "Initialized from retrieved evidence",
+                    "prior_belief": 0.45,
+                    "uncertainty": 0.65,
+                    "testability_score": 0.5
+                })
+
+        if not hypotheses:
+            self._add_state_hypothesis(hypotheses, {
+                "hypothesis": f"Mechanistic drivers of {topic} remain under-specified.",
+                "rationale": "Fallback prior due to sparse evidence",
+                "prior_belief": 0.4,
+                "uncertainty": 0.75,
+                "testability_score": 0.4
+            })
+
+        return {
+            'hypotheses': hypotheses,
+            'retrieved': retrieved,
+            'knowledge': knowledge,
+            'experiments': [],
+            'action_history': [],
+            'total_information_gain': 0.0,
+            'last_gaps': []
+        }
+
+    def _select_epistemic_tool(self, state: Dict[str, Any], step: int, max_steps: int) -> Tuple[str, Dict[str, Any]]:
+        if len(state['hypotheses']) < 2:
+            forced = self._estimate_tool_utility(state, "propose_hypotheses", step, max_steps)
+            forced['reason'] = "Hypothesis space too small; force expansion."
+            return "propose_hypotheses", forced
+
+        if step == 0 and not state.get('knowledge'):
+            forced = self._estimate_tool_utility(state, "retrieve_evidence", step, max_steps)
+            forced['reason'] = "No starting evidence context; force retrieval."
+            return "retrieve_evidence", forced
+
+        scored = {
+            action: self._estimate_tool_utility(state, action, step, max_steps)
+            for action in self.TOOL_ACTIONS
+        }
+        best_action = max(scored.items(), key=lambda kv: kv[1]['utility'])[0]
+        return best_action, scored[best_action]
+
+    def _estimate_tool_utility(self, state: Dict[str, Any], action: str,
+                               step: int, max_steps: int) -> Dict[str, Any]:
+        hypotheses = state.get('hypotheses', [])
+        entropy = self._belief_entropy(hypotheses)
+        if hypotheses:
+            uncertainty_values = [_safe_float(h.get('uncertainty', 0.5), 0.5) for h in hypotheses]
+            avg_uncertainty = sum(uncertainty_values) / max(len(uncertainty_values), 1)
+        else:
+            avg_uncertainty = 0.8
+        max_belief = max([h.get('belief', 0.5) for h in hypotheses], default=0.5)
+        num_experiments = len(state.get('experiments', []))
+        progress = (step + 1) / max(max_steps, 1)
+
+        if action == "retrieve_evidence":
+            expected_gain = 0.25 + 0.45 * avg_uncertainty + 0.20 * entropy
+            cost = 0.35
+            risk = 0.10
+            reason = "Evidence retrieval lowers epistemic uncertainty and supports posterior updates."
+        elif action == "propose_hypotheses":
+            expected_gain = 0.40 if len(hypotheses) < 4 else 0.18
+            expected_gain += 0.20 * entropy
+            cost = 0.28
+            risk = 0.22
+            reason = "Hypothesis expansion increases search breadth when belief mass is diffuse."
+        elif action == "audit_contradictions":
+            expected_gain = 0.20 + 0.35 * max_belief + 0.15 * avg_uncertainty
+            cost = 0.30
+            risk = 0.08
+            reason = "Contradiction audits prevent overconfident belief collapse."
+        elif action == "design_experiments":
+            expected_gain = 0.08 + 0.20 * (1.0 - entropy) + (0.15 if num_experiments == 0 else 0.05)
+            expected_gain += 0.10 * progress
+            cost = 0.20
+            risk = 0.05
+            reason = "Experiment design converts uncertain beliefs into testable next actions."
+        else:
+            expected_gain = 0.15 + 0.35 * entropy
+            cost = 0.24
+            risk = 0.12
+            reason = "Belief recalibration improves posterior calibration and stopping confidence."
+
+        utility = expected_gain - self.lambda_cost * cost - self.mu_risk * risk
+        return {
+            'expected_information_gain': expected_gain,
+            'cost': cost,
+            'risk': risk,
+            'utility': utility,
+            'reason': reason
+        }
+
+    def _execute_epistemic_tool(self, action: str, topic: str,
+                                state: Dict[str, Any], step: int,
+                                total: int) -> Dict[str, Any]:
+        base = {
+            'iteration': step,
+            'gaps': [],
+            'hypotheses': [],
+            'ranked_hypotheses': [],
+            'experiments': [],
+            'insights': [],
+            'feedback': None
+        }
+        if action == "retrieve_evidence":
+            base.update(self._tool_retrieve_evidence(topic, state, step, total))
+        elif action == "propose_hypotheses":
+            base.update(self._tool_propose_hypotheses(topic, state, step, total))
+        elif action == "audit_contradictions":
+            base.update(self._tool_audit_contradictions(topic, state, step, total))
+        elif action == "design_experiments":
+            base.update(self._tool_design_experiments(topic, state, step, total))
+        else:
+            base.update(self._tool_recalibrate_beliefs(topic, state, step, total))
+        state['action_history'].append(action)
+        return base
+
+    def _tool_retrieve_evidence(self, topic: str, state: Dict[str, Any],
+                                step: int, total: int) -> Dict[str, Any]:
+        ranked = sorted(state['hypotheses'], key=lambda h: h.get('uncertainty', 0.0), reverse=True)
+        query_focus = " ".join([h.get('hypothesis', '')[:90] for h in ranked[:2]])
+        query = f"{topic} {query_focus}".strip()
+        retrieved = self.memory.retrieve(
+            query,
+            top_k=15,
+            strategy="agentic",
+            allowed_types=self.EVIDENCE_TYPES
+        )
+        knowledge = "\n".join([f"[{i}] {mem.content}" for i, (mem, _) in enumerate(retrieved[:12])])
+        state['retrieved'] = retrieved
+        state['knowledge'] = knowledge
+
+        prompt = f"""Update hypothesis beliefs using new evidence for topic "{topic}".
+Step {step}/{total}.
+
+Hypotheses:
+{json.dumps(state['hypotheses'], ensure_ascii=True)}
+
+Evidence:
+{knowledge if knowledge else "No new evidence retrieved."}
+
+Return JSON:
+{{
+  "updates":[{{"hypothesis":"...", "support_delta":0.0, "uncertainty_delta":0.0, "evidence_note":"..."}}],
+  "gaps":["..."],
+  "insights":["..."]
+}}
+Rules:
+- support_delta in [-0.25, 0.25]
+- uncertainty_delta in [-0.2, 0.2]
+- be conservative; avoid extreme changes
+Return ONLY JSON."""
+        updates, gaps, insights = [], [], []
+        response = self.llm.generate(prompt)
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                updates = [u for u in parsed.get('updates', []) if isinstance(u, dict)]
+                gaps = [g for g in parsed.get('gaps', []) if isinstance(g, str)]
+                insights = [i for i in parsed.get('insights', []) if isinstance(i, str)]
+        self._apply_hypothesis_updates(state['hypotheses'], updates)
+        state['last_gaps'] = gaps
+
+        if not insights and retrieved:
+            insights = [f"Retrieved {len(retrieved)} evidence items to refine posterior beliefs."]
+        return {
+            'gaps': gaps[:3],
+            'insights': insights[:3],
+            'feedback': {'retrieved_items': len(retrieved)}
+        }
+
+    def _tool_propose_hypotheses(self, topic: str, state: Dict[str, Any],
+                                 step: int, total: int) -> Dict[str, Any]:
+        prompt = f"""Propose 1-3 new falsifiable hypotheses for "{topic}".
+Avoid duplicates with existing hypotheses.
+
+Existing hypotheses:
+{json.dumps(state['hypotheses'], ensure_ascii=True)}
+Known gaps:
+{json.dumps(state.get('last_gaps', []), ensure_ascii=True)}
+
+Return JSON array:
+[{{"hypothesis":"...", "rationale":"...", "prior_belief":0.0, "uncertainty":0.0, "testability_score":0.0}}]
+Return ONLY JSON array."""
+        response = self.llm.generate(prompt)
+        new_hypotheses: List[Dict[str, Any]] = []
+        if response:
+            parsed = _extract_first_json(response, list)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    if self._add_state_hypothesis(state['hypotheses'], item):
+                        new_hypotheses.append(item)
+        insights = []
+        if new_hypotheses:
+            insights.append(f"Expanded hypothesis space with {len(new_hypotheses)} candidate mechanisms.")
+        return {
+            'hypotheses': new_hypotheses[:3],
+            'insights': insights[:3]
+        }
+
+    def _tool_audit_contradictions(self, topic: str, state: Dict[str, Any],
+                                   step: int, total: int) -> Dict[str, Any]:
+        contradiction_query = f"{topic} contradiction conflict inconsistent"
+        retrieved = self.memory.retrieve(
+            contradiction_query,
+            top_k=10,
+            strategy="hybrid",
+            allowed_types=None
+        )
+        contradiction_notes = []
+        for mem, _ in retrieved:
+            mem_type = getattr(mem.memory_type, "value", "")
+            if mem_type == MemoryType.CONTRADICTION.value:
+                contradiction_notes.append(mem.content)
+        contradiction_text = "\n".join([f"- {c}" for c in contradiction_notes[:6]])
+        prompt = f"""Audit current hypotheses for contradictions in topic "{topic}".
+
+Hypotheses:
+{json.dumps(state['hypotheses'], ensure_ascii=True)}
+Contradiction evidence:
+{contradiction_text if contradiction_text else "No explicit contradiction memcells found."}
+
+Return JSON:
+{{
+  "updates":[{{"hypothesis":"...", "support_delta":0.0, "uncertainty_delta":0.0, "evidence_note":"..."}}],
+  "weaknesses":["..."],
+  "insights":["..."]
+}}
+Rules:
+- Penalize overconfident hypotheses when contradiction signals exist.
+- support_delta in [-0.25, 0.10], uncertainty_delta in [-0.05, 0.20]
+Return ONLY JSON."""
+        updates, weaknesses, insights = [], [], []
+        response = self.llm.generate(prompt)
+        if response:
+            parsed = _extract_first_json(response, dict)
+            if isinstance(parsed, dict):
+                updates = [u for u in parsed.get('updates', []) if isinstance(u, dict)]
+                weaknesses = [w for w in parsed.get('weaknesses', []) if isinstance(w, str)]
+                insights = [i for i in parsed.get('insights', []) if isinstance(i, str)]
+        self._apply_hypothesis_updates(state['hypotheses'], updates)
+        if not insights and contradiction_notes:
+            insights = [f"Detected {len(contradiction_notes)} contradiction signals to down-weight brittle hypotheses."]
+        return {
+            'insights': insights[:3],
+            'feedback': {'weaknesses': weaknesses[:4], 'contradiction_signals': len(contradiction_notes)}
+        }
+
+    def _tool_design_experiments(self, topic: str, state: Dict[str, Any],
+                                 step: int, total: int) -> Dict[str, Any]:
+        ranked = self._rank_state_hypotheses(state['hypotheses'])[:4]
+        experiments = self._design_experiments(topic, ranked)
+        if experiments:
+            state['experiments'].extend(experiments[:3])
+            for exp in experiments[:3]:
+                idx = self._find_hypothesis_index(state['hypotheses'], exp.get('hypothesis', ''))
+                if idx is not None:
+                    h = state['hypotheses'][idx]
+                    h['uncertainty'] = self._clip(h.get('uncertainty', 0.5) - 0.05, 0.01, 0.99)
+        insights = []
+        if experiments:
+            insights = [f"Designed {len(experiments[:3])} minimum-viable experiments to maximize falsifiability."]
+        return {
+            'ranked_hypotheses': ranked[:3],
+            'experiments': experiments[:3],
+            'insights': insights[:2]
+        }
+
+    def _tool_recalibrate_beliefs(self, topic: str, state: Dict[str, Any],
+                                  step: int, total: int) -> Dict[str, Any]:
+        prompt = f"""Recalibrate posterior belief and uncertainty for hypotheses on "{topic}".
+Use conservative Bayesian-style judgment from current evidence.
+
+Hypotheses:
+{json.dumps(state['hypotheses'], ensure_ascii=True)}
+
+Return JSON array:
+[{{"hypothesis":"...", "belief":0.0, "uncertainty":0.0, "rationale":"..."}}]
+Rules:
+- belief and uncertainty must remain in [0,1]
+- avoid collapsing all belief mass to one hypothesis without strong evidence
+Return ONLY JSON array."""
+        response = self.llm.generate(prompt)
+        insights = []
+        if response:
+            parsed = _extract_first_json(response, list)
+            if isinstance(parsed, list):
+                updates = []
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    updates.append({
+                        'hypothesis': item.get('hypothesis', ''),
+                        'support_delta': self._clip(_safe_float(item.get('belief', 0.5), 0.5), 0.0, 1.0),
+                        'uncertainty_delta': self._clip(_safe_float(item.get('uncertainty', 0.5), 0.5), 0.0, 1.0),
+                        'absolute': True
+                    })
+                self._apply_hypothesis_updates(state['hypotheses'], updates, absolute=True)
+        ranked = self._rank_state_hypotheses(state['hypotheses'])
+        if ranked:
+            strongest = ranked[0].get('hypothesis', '')[:130]
+            insights.append(f"Posterior recalibrated; strongest current hypothesis: {strongest}")
+        return {
+            'ranked_hypotheses': ranked[:3],
+            'insights': insights[:2]
+        }
+
+    def _rank_state_hypotheses(self, hypotheses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ranked = []
+        for item in hypotheses:
+            belief = self._clip(_safe_float(item.get('belief', 0.5), 0.5), 0.0, 1.0)
+            uncertainty = self._clip(_safe_float(item.get('uncertainty', 0.5), 0.5), 0.0, 1.0)
+            testability = self._clip(_safe_float(item.get('testability_score', 0.5), 0.5), 0.0, 1.0)
+            priority = belief * (1.0 - uncertainty) * (0.5 + 0.5 * testability)
+            ranked.append({
+                **item,
+                'belief': belief,
+                'uncertainty': uncertainty,
+                'testability_score': testability,
+                'priority_score': priority,
+                'status': item.get('status', 'ranked')
+            })
+        ranked.sort(key=lambda x: x.get('priority_score', 0.0), reverse=True)
+        return ranked
+
+    def _apply_hypothesis_updates(self, hypotheses: List[Dict[str, Any]],
+                                  updates: List[Dict[str, Any]],
+                                  absolute: bool = False):
+        for upd in updates:
+            idx = self._find_hypothesis_index(hypotheses, upd.get('hypothesis', ''))
+            if idx is None:
+                continue
+            h = hypotheses[idx]
+            if absolute or upd.get('absolute'):
+                h['belief'] = self._clip(_safe_float(upd.get('support_delta', h.get('belief', 0.5)), h.get('belief', 0.5)), 0.0, 1.0)
+                h['uncertainty'] = self._clip(_safe_float(upd.get('uncertainty_delta', h.get('uncertainty', 0.5)), h.get('uncertainty', 0.5)), 0.0, 1.0)
+            else:
+                h['belief'] = self._clip(h.get('belief', 0.5) + _safe_float(upd.get('support_delta', 0.0), 0.0), 0.0, 1.0)
+                h['uncertainty'] = self._clip(h.get('uncertainty', 0.5) + _safe_float(upd.get('uncertainty_delta', 0.0), 0.0), 0.0, 1.0)
+            note = upd.get('evidence_note')
+            if note and isinstance(note, str):
+                h['latest_update_note'] = note[:240]
+
+    def _add_state_hypothesis(self, hypotheses: List[Dict[str, Any]], item: Dict[str, Any]) -> bool:
+        hypothesis_text = str(item.get('hypothesis', '')).strip()
+        if len(hypothesis_text) < 10:
+            return False
+        if self._find_hypothesis_index(hypotheses, hypothesis_text) is not None:
+            return False
+        entry = {
+            'id': f"hyp_{len(hypotheses) + 1}",
+            'hypothesis': hypothesis_text,
+            'rationale': str(item.get('rationale', '')),
+            'belief': self._clip(_safe_float(item.get('prior_belief', item.get('belief', 0.45)), 0.45), 0.0, 1.0),
+            'uncertainty': self._clip(_safe_float(item.get('uncertainty', 0.65), 0.65), 0.0, 1.0),
+            'testability_score': self._clip(_safe_float(item.get('testability_score', 0.5), 0.5), 0.0, 1.0),
+            'status': item.get('status', 'active')
+        }
+        hypotheses.append(entry)
+        return True
+
+    def _find_hypothesis_index(self, hypotheses: List[Dict[str, Any]], text: str) -> Optional[int]:
+        needle = re.sub(r'[^a-z0-9 ]+', ' ', str(text).lower()).strip()
+        if not needle:
+            return None
+        needle_tokens = set(needle.split())
+        best_idx, best_score = None, 0.0
+        for idx, item in enumerate(hypotheses):
+            cand = re.sub(r'[^a-z0-9 ]+', ' ', str(item.get('hypothesis', '')).lower()).strip()
+            if not cand:
+                continue
+            if cand == needle or needle in cand or cand in needle:
+                return idx
+            cand_tokens = set(cand.split())
+            overlap = len(needle_tokens & cand_tokens)
+            denom = max(len(needle_tokens), 1)
+            score = overlap / denom
+            if score > best_score:
+                best_idx, best_score = idx, score
+        if best_score >= 0.5:
+            return best_idx
+        return None
+
+    @staticmethod
+    def _belief_entropy(hypotheses: List[Dict[str, Any]]) -> float:
+        if not hypotheses:
+            return 1.0
+        weights = [max(1e-6, _safe_float(h.get('belief', 0.0), 0.0)) for h in hypotheses]
+        total = sum(weights)
+        if total <= 0:
+            return 1.0
+        probs = [w / total for w in weights]
+        n = len(probs)
+        if n <= 1:
+            return 0.0
+        entropy = -sum(p * math.log(p) for p in probs if p > 0.0) / math.log(n)
+        return float(max(0.0, min(1.0, entropy)))
+
+    @staticmethod
+    def _clip(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _synthesize_epistemic(self, topic: str, iterations: List[Dict[str, Any]],
+                              state: Dict[str, Any]) -> Optional[str]:
+        ranked = self._rank_state_hypotheses(state.get('hypotheses', []))[:5]
+        tool_trace = [
+            {
+                'tool': it.get('selected_tool'),
+                'expected_information_gain': it.get('expected_information_gain', 0.0),
+                'realized_information_gain': it.get('realized_information_gain', 0.0),
+                'entropy_after': it.get('entropy_after', 1.0),
+            }
+            for it in iterations
+        ]
+        prompt = f"""Write a scientific synthesis for topic "{topic}" using an epistemic tool policy trajectory.
+
+Top posterior hypotheses:
+{json.dumps(ranked, ensure_ascii=True)}
+
+Tool trajectory:
+{json.dumps(tool_trace[:10], ensure_ascii=True)}
+
+Generated experiments:
+{json.dumps(state.get('experiments', [])[:5], ensure_ascii=True)}
+
+Write 4 concise paragraphs:
+1) Posterior state of knowledge and remaining uncertainty
+2) Highest-priority hypotheses and confidence rationale
+3) Contradictions/risks that still threaten validity
+4) Next experimental actions with measurable outcomes
+
+Write as a principal investigator preparing a lab decision memo."""
+        synthesis = self.llm.generate(prompt)
+        if synthesis:
+            return synthesis
+        return (
+            f"Epistemic exploration of {topic} completed. "
+            f"Final entropy={self._belief_entropy(state.get('hypotheses', [])):.3f}. "
+            f"Generated {len(state.get('experiments', []))} experiments."
+        )
 
     def _run_iteration(self, topic: str, iteration: int, total: int,
                        accumulated: List[str],
@@ -2735,10 +3375,14 @@ class SynapseBrain:
         self._log_event("explore", {
             "topic": topic,
             "depth": depth,
+            "mode": result.get("mode"),
             "iterations": len(result.get("iterations", [])),
             "duration": result.get("total_duration", 0.0),
             "ranked_hypotheses_count": len(first_iter.get("ranked_hypotheses", [])),
             "experiments_count": len(first_iter.get("experiments", [])),
+            "epistemic_information_gain": (result.get("epistemic_policy") or {}).get("total_information_gain"),
+            "epistemic_final_entropy": (result.get("epistemic_policy") or {}).get("final_entropy"),
+            "epistemic_stop_reason": (result.get("epistemic_policy") or {}).get("stop_reason"),
             "error": result.get("error")
         })
         self._auto_save()

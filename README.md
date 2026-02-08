@@ -28,6 +28,10 @@ Environment variables:
 - `GEMINI_EMBEDDING_MODEL`: fixed embedding model for all runs (default `gemini-embedding-001`).
 - `GEMINI_EMBEDDING_DIM`: embedding output dimensionality (default `768`).
 - `SYNAPSE_AUTO_BACKFILL_EMBEDDINGS`: auto-embed legacy memories missing vectors at startup.
+- `SYNAPSE_EXPLORER_MODE`: exploration mode (`epistemic_tools` or `legacy`).
+- `SYNAPSE_EPISTEMIC_LAMBDA_COST`: cost penalty in epistemic tool utility.
+- `SYNAPSE_EPISTEMIC_MU_RISK`: risk penalty in epistemic tool utility.
+- `SYNAPSE_EPISTEMIC_STOP_ENTROPY`: stopping threshold for posterior entropy.
 - `SYNAPSE_MEMORY_DIR`: persistent memory directory (default `.synapse_memory`).
 
 ## LLM requirement
@@ -92,3 +96,5 @@ Details: `evaluation/README.md`
 - QA evidence retrieval is now purity-filtered to `ATOMIC_FACT` and `EPISODE` only.
 - Long documents are processed with chunked extraction and hierarchical summarization.
 - FAISS is used by default for vector retrieval speed; if unavailable at runtime, retrieval falls back to in-memory cosine search.
+- Scientific exploration now defaults to an epistemic tool policy that selects tools by expected information gain minus cost/risk penalties.
+- Theory and formal objective: `EPISTEMIC_TOOL_POLICY.md`.
